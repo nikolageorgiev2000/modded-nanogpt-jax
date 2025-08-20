@@ -1,3 +1,16 @@
+====================================================================================================
+"""
+TODOs
+- flex attention (or other) kernel, preferably block-sparse for packing reasons
+  - if varlen, attn window warmup
+- experiment with d_model/d_head/attn variants to fix low arithmetic intensity for attn
+- async data loading (and comms in general)
+- why ~50% hbm util? look for unnecessary syncs
+- optimizers - sharding pytrees across devices
+- tune lr schedule/n_train_iters in current script (and general hparam sweeps across changes)
+- figure out training with value embeddings (seems to increase step time disproportionately)
+"""
+
 import os
 import sys
 import glob
@@ -11,7 +24,6 @@ jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
-
 import jax.numpy as jnp
 from jax import jit, value_and_grad
 from jax.lax import fori_loop, rsqrt, cond, scan
@@ -166,9 +178,10 @@ class Config:
     save_every: int = 0
 
     # input sizes
-    batch_size: int = 8 * 64  # batch size for min_sequence_length
+    batch_size: int = 8 * 64 # batch size for min_sequence_length
     micro_batch_size: int = 16
     min_sequence_length: int = 1024
+    # max_sequence_length: int = 2048 - 512
     max_sequence_length: int = 2048
     sequence_warmup_intervals: int = 1024
 
@@ -213,15 +226,18 @@ class Config:
 
     # sharding
     weight_sharding = None
-    activation_sharding = (None, "dp")
+    activation_sharding = (
+        None,
+        "dp",
+    )  # gradient accumulation axis, micro-batch axis, remaining are automatically None
+    attention_sharding = ("dp", None, None, None)
 
     def __post_init__(self):
         object.__setattr__(self, "mesh_shape", (jax.device_count(),))
         assert self.batch_size % self.micro_batch_size == 0
 
         object.__setattr__(
-            self, "n_warmdown_iters", int(self.n_train_iters * self.f_warmdown_iters)
-        )
+            self, "n_warmdown_iters", int(self.n_train_iters * self.f_warmdown_iters))
         assert self.d_model % self.n_heads == 0
         object.__setattr__(self, "d_head", self.d_model // self.n_heads)
         assert self.n_layers % 2 == 0
@@ -273,12 +289,8 @@ def adam(
         lr = base_lr * get_lr(
             state["step"], n_warmup_iters, n_warmdown_iters, n_train_iters
         )
-        m = tree_map(
-            lambda m, g: (b1 * m + (1 - b1) * g).astype(m.dtype), state["m"], grads
-        )
-        v = tree_map(
-            lambda v, g: (b2 * v + (1 - b2) * g**2).astype(v.dtype), state["v"], grads
-        )
+        m = tree_map(lambda m, g: (b1 * m + (1 - b1) * g).astype(m.dtype), state["m"], grads)
+        v = tree_map(lambda v, g: (b2 * v + (1 - b2) * g**2).astype(v.dtype), state["v"], grads)
         m_hat = tree_map(lambda m: (m / (1 - b1**step)).astype(m.dtype), m)
         v_hat = tree_map(lambda v: (v / (1 - b2**step)).astype(v.dtype), v)
         updates = tree_map(lambda m, v: lr * m / (jnp.sqrt(v) + adam_eps), m_hat, v_hat)
@@ -338,14 +350,10 @@ def muon(
         step = state["step"]
         lr = base_lr * get_lr(step, n_warmup_iters, n_warmdown_iters, n_train_iters)
         frac = jnp.minimum(step / momentum_warmup_steps, 1.0)
-        momentum = warmup_momentum_init + frac * (
+        momentum = (warmup_momentum_init + frac * (
             warmup_momentum_final - warmup_momentum_init
-        )
-        new_m = tree_map(
-            lambda m, g: (m + (1 - momentum).astype(m.dtype) * (g - m)).astype(m.dtype),
-            state["m"],
-            grads,
-        )
+        ))
+        new_m = tree_map(lambda m, g: (m + (1 - momentum).astype(m.dtype) * (g - m)).astype(m.dtype), state["m"], grads)
 
         def _update_leaf(g, p, m):
             g_nesterov = g + momentum.astype(m.dtype) * (m - g)
@@ -449,14 +457,25 @@ def _get_shape_for_step(step: int, config: Config):
     )
     if config.max_sequence_length not in available_seq_lens:
         available_seq_lens = np.append(available_seq_lens, config.max_sequence_length)
+
     n_lens = len(available_seq_lens)
     idx = int((step / config.n_train_iters) * n_lens)
     current_seq_len = available_seq_lens[idx]
+    # progress = step / max(1, config.n_train_iters - 1)
+    # target_len = config.min_sequence_length + progress * (
+    #     config.max_sequence_length - config.min_sequence_length
+    # )
+    # current_seq_len = available_seq_lens[
+    #     np.argmin(np.abs(available_seq_lens - target_len))
+    # ]
+
     total_tokens = config.batch_size * config.min_sequence_length
     current_B = total_tokens // current_seq_len
     current_B = (current_B // config.micro_batch_size) * config.micro_batch_size
     current_B = max(current_B, config.micro_batch_size)
+
     current_n_grad_acc = current_B // config.micro_batch_size
+
     return int(current_seq_len), int(current_B), int(current_n_grad_acc)
 
 
@@ -523,14 +542,16 @@ def load_dataset(
                 start_idx = 0
                 end_idx = tokens_for_this_batch + 1
                 if end_idx > len(all_tokens):
-                    raise RuntimeError(
-                        f"Not enough tokens ({len(all_tokens)}) to form even one batch of size {tokens_for_this_batch+1}."
-                    )
+                     raise RuntimeError(f"Not enough tokens ({len(all_tokens)}) to form even one batch of size {tokens_for_this_batch+1}.")
             buf = all_tokens[start_idx:end_idx]
             x = np.array(buf[:-1], dtype=np.int32).reshape(batch_size, seq_len)
             y = np.array(buf[1:], dtype=np.int32).reshape(batch_size, seq_len)
-            batched_x = einops.rearrange(x, "(a b) ... -> a b ...", a=n_grad_acc_steps)
-            batched_y = einops.rearrange(y, "(a b) ... -> a b ...", a=n_grad_acc_steps)
+            batched_x = einops.rearrange(
+                x, "(a b) ... -> a b ...", a=n_grad_acc_steps
+            )
+            batched_y = einops.rearrange(
+                y, "(a b) ... -> a b ...", a=n_grad_acc_steps
+            )
             batched_x = jax.device_put(batched_x, activation_sharding)
             batched_y = jax.device_put(batched_y, activation_sharding)
             precomputed_batches.append((batched_x, batched_y))
@@ -539,10 +560,8 @@ def load_dataset(
         f"Process {process_rank}/{num_processes} pre-computed {len(precomputed_batches)} batches."
     )
     if num_global_batches > 0 and not precomputed_batches:
-        raise RuntimeError(
-            f"Process {process_rank} could not create any batches. "
-            "Check data size, batch configuration, and number of processes."
-        )
+         raise RuntimeError(f"Process {process_rank} could not create any batches. "
+                            "Check data size, batch configuration, and number of processes.")
     return precomputed_batches
 
 
@@ -712,6 +731,7 @@ def attention_forward(params, x, v1, cos, sin, config):
         params["c_qkv"], "(three h d) c -> three h d c", d=config.d_head, three=3
     )
     q, k, v = einops.einsum(x, params_qkv, "b t c, three h d c -> three b t h d")
+
     if v1 is None:
         v1 = v
     v = (1 - params["lamb"]) * v + params["lamb"] * v1.reshape(v.shape)
@@ -808,9 +828,7 @@ def train_step(
         micro_step, init_carry, (batched_x, batched_y)
     )
     avg_loss = total_loss / n_grad_acc_steps
-    final_grads = tree_map(
-        lambda g: (g / n_grad_acc_steps).astype(g.dtype), final_grads_accum
-    )
+    final_grads = tree_map(lambda g: (g / n_grad_acc_steps).astype(g.dtype), final_grads_accum)
     new_params, new_opt_state = optimizer.update(final_grads, params, opt_state)
     return new_params, new_opt_state, {"loss": avg_loss}
 
@@ -823,7 +841,6 @@ def eval_step(
     config: Config,
 ) -> jax.Array:
     n_grad_acc_steps = batched_x.shape[0]
-
     def loss_loop_body(i, accumulated_loss):
         micro_batch = (batched_x[i], batched_y[i])
         loss = loss_fn(params, micro_batch, precomputed_params, config)
@@ -852,8 +869,10 @@ def run_evaluation(
         val_loss_accum += loss
         val_steps += 1
     if val_steps == 0:
-        if step == config.val_loss_every or step >= config.n_train_iters - 1:
-            logger.msg("Warning: Validation loader was empty, no validation was run.")
+        if step == config.val_loss_every or step >= config.n_train_iters -1:
+            logger.msg(
+                "Warning: Validation loader was empty, no validation was run."
+            )
         return
     final_val_loss = val_loss_accum / val_steps
     logger.log({"step": step, "val_loss": final_val_loss})
@@ -867,11 +886,7 @@ def train_loop(config: Config):
     with mesh:
         params, precomputed_params = init_params(config, mesh)
         optimizer, opt_state = init_optimizer(config, params, mesh)
-
-        # ahead of time compilation
-        jitted_train_step = jit(
-            train_step, static_argnames=("config", "optimizer"), donate_argnums=(1, 3)
-        )
+        jitted_train_step = jit(train_step, static_argnames=("config", "optimizer"), donate_argnums=(1, 3))
         jitted_eval_step = jit(eval_step, static_argnames=("config",))
         logger.msg("Determining all unique training shapes...")
         train_shapes = {
@@ -902,13 +917,7 @@ def train_loop(config: Config):
             dummy_x = jax.device_put(dummy_x, activation_sharding)
             dummy_y = jax.device_put(dummy_y, activation_sharding)
             compiled_fn = jitted_train_step.lower(
-                config,
-                params,
-                precomputed_params,
-                opt_state,
-                optimizer,
-                dummy_x,
-                dummy_y,
+                config, params, precomputed_params, opt_state, optimizer, dummy_x, dummy_y
             ).compile()
             compiled_train_steps[shape_key] = compiled_fn
             if shape_key == val_shape:
@@ -917,11 +926,11 @@ def train_loop(config: Config):
                 ).compile()
         logger.msg("AOT compilation finished for all function variants.")
 
-        # data loading
         logger.msg("Pre-computing and loading all training batches...")
         train_batches = load_dataset(config, logger, mesh, is_training=True)
         train_loader = iter(train_batches)
         logger.msg(f"Loaded {len(train_batches)} training batches for this process.")
+
         logger.msg("Pre-computing and loading all validation batches...")
         val_batches = load_dataset(val_config, logger, mesh, is_training=False)
         logger.msg(f"Loaded {len(val_batches)} validation batches for this process.")
@@ -945,28 +954,14 @@ def train_loop(config: Config):
                 logger.log({"step": step, "time": datetime.datetime.now()} | metrics)
             if step > 0 and (step % config.val_loss_every == 0):
                 run_evaluation(
-                    step,
-                    config,
-                    params,
-                    iter(val_batches),
-                    precomputed_params,
-                    mesh,
-                    logger,
-                    compiled_eval_fn,
+                    step, config, params, iter(val_batches), precomputed_params, mesh, logger, compiled_eval_fn
                 )
             if config.save_every > 0 and step > 0 and (step % config.save_every == 0):
                 logger.dump(step, params, opt_state, config)
         logger.flush()
         logger.msg("Final validation")
         run_evaluation(
-            step,
-            config,
-            params,
-            iter(val_batches),
-            precomputed_params,
-            mesh,
-            logger,
-            compiled_eval_fn,
+            step, config, params, iter(val_batches), precomputed_params, mesh, logger, compiled_eval_fn
         )
         logger.flush()
         logger.msg("Training finished.")
@@ -976,3 +971,233 @@ def train_loop(config: Config):
 if __name__ == "__main__":
     config = Config()
     train_loop(config)
+
+====================================================================================================
+[MESSAGE] Determining all unique training shapes...
+[MESSAGE] Starting Ahead-of-Time (AOT) compilation for all shapes...
+[MESSAGE] AOT compiling for seq_len=1024, B=512, grad_acc=32...
+[MESSAGE] AOT compiling for seq_len=2048, B=256, grad_acc=16...
+[MESSAGE] AOT compilation finished for all function variants.
+[MESSAGE] Pre-computing and loading all training batches...
+[MESSAGE] Process 0/1 starting data pre-loading into RAM...
+[MESSAGE] Process 0/1 finished loading 6.00 GB of tokens.
+[MESSAGE] Process 0/1 pre-computed 1675 batches.
+[MESSAGE] Loaded 1675 training batches for this process.
+[MESSAGE] Pre-computing and loading all validation batches...
+[MESSAGE] Process 0/1 starting data pre-loading into RAM...
+[MESSAGE] Process 0/1 finished loading 0.20 GB of tokens.
+[MESSAGE] Process 0/1 pre-computed 20 batches.
+[MESSAGE] Loaded 20 validation batches for this process.
+[MESSAGE] Starting training...
+[METRICS (1 step stale)] step: 9  |  time: 2025-08-20 13:50:50.485907  |  loss: 6.471743583679199
+[METRICS (1 step stale)] step: 19  |  time: 2025-08-20 13:50:50.516435  |  loss: 6.047224998474121
+[METRICS (1 step stale)] step: 29  |  time: 2025-08-20 13:50:53.609852  |  loss: 5.782470703125
+[METRICS (1 step stale)] step: 39  |  time: 2025-08-20 13:50:56.683170  |  loss: 5.512787342071533
+[METRICS (1 step stale)] step: 49  |  time: 2025-08-20 13:50:59.756620  |  loss: 5.361858367919922
+[METRICS (1 step stale)] step: 59  |  time: 2025-08-20 13:51:02.829865  |  loss: 5.1754302978515625
+[METRICS (1 step stale)] step: 69  |  time: 2025-08-20 13:51:05.902741  |  loss: 5.034331321716309
+[METRICS (1 step stale)] step: 79  |  time: 2025-08-20 13:51:08.976037  |  loss: 4.853498935699463
+[METRICS (1 step stale)] step: 89  |  time: 2025-08-20 13:51:12.048553  |  loss: 4.690052509307861
+[METRICS (1 step stale)] step: 99  |  time: 2025-08-20 13:51:15.121923  |  loss: 4.592535495758057
+[METRICS (1 step stale)] step: 109  |  time: 2025-08-20 13:51:18.194632  |  loss: 4.586787223815918
+[MESSAGE] Running validation for step 125...
+[METRICS (1 step stale)] step: 119  |  time: 2025-08-20 13:51:21.267343  |  loss: 4.439126491546631
+[MESSAGE] Validation finished for step 125.
+[METRICS (1 step stale)] step: 125  |  val_loss: 4.378868579864502
+[METRICS (1 step stale)] step: 129  |  time: 2025-08-20 13:51:29.866469  |  loss: 4.3136305809021
+[METRICS (1 step stale)] step: 139  |  time: 2025-08-20 13:51:31.083749  |  loss: 4.403034210205078
+[METRICS (1 step stale)] step: 149  |  time: 2025-08-20 13:51:32.312318  |  loss: 4.317258358001709
+[METRICS (1 step stale)] step: 159  |  time: 2025-08-20 13:51:35.383015  |  loss: 4.266417503356934
+[METRICS (1 step stale)] step: 169  |  time: 2025-08-20 13:51:38.454729  |  loss: 4.174162864685059
+[METRICS (1 step stale)] step: 179  |  time: 2025-08-20 13:51:41.524670  |  loss: 4.178581714630127
+[METRICS (1 step stale)] step: 189  |  time: 2025-08-20 13:51:44.595092  |  loss: 4.1373796463012695
+[METRICS (1 step stale)] step: 199  |  time: 2025-08-20 13:51:47.665457  |  loss: 4.1474151611328125
+[METRICS (1 step stale)] step: 209  |  time: 2025-08-20 13:51:50.735650  |  loss: 4.031351566314697
+[METRICS (1 step stale)] step: 219  |  time: 2025-08-20 13:51:53.806046  |  loss: 4.0923895835876465
+[METRICS (1 step stale)] step: 229  |  time: 2025-08-20 13:51:56.876283  |  loss: 4.0985612869262695
+[METRICS (1 step stale)] step: 239  |  time: 2025-08-20 13:51:59.946486  |  loss: 4.002068996429443
+[MESSAGE] Running validation for step 250...
+[METRICS (1 step stale)] step: 249  |  time: 2025-08-20 13:52:03.016231  |  loss: 4.068719387054443
+[MESSAGE] Validation finished for step 250.
+[METRICS (1 step stale)] step: 250  |  val_loss: 3.9816060066223145
+[METRICS (1 step stale)] step: 259  |  time: 2025-08-20 13:52:10.259963  |  loss: 3.9959166049957275
+[METRICS (1 step stale)] step: 269  |  time: 2025-08-20 13:52:11.290507  |  loss: 4.009436130523682
+[METRICS (1 step stale)] step: 279  |  time: 2025-08-20 13:52:14.054369  |  loss: 3.9717233180999756
+[METRICS (1 step stale)] step: 289  |  time: 2025-08-20 13:52:17.124270  |  loss: 3.9549062252044678
+[METRICS (1 step stale)] step: 299  |  time: 2025-08-20 13:52:20.193791  |  loss: 3.95847749710083
+[METRICS (1 step stale)] step: 309  |  time: 2025-08-20 13:52:23.263515  |  loss: 3.9942121505737305
+[METRICS (1 step stale)] step: 319  |  time: 2025-08-20 13:52:26.333754  |  loss: 3.99407958984375
+[METRICS (1 step stale)] step: 329  |  time: 2025-08-20 13:52:29.403493  |  loss: 3.952791213989258
+[METRICS (1 step stale)] step: 339  |  time: 2025-08-20 13:52:32.473394  |  loss: 3.8804521560668945
+[METRICS (1 step stale)] step: 349  |  time: 2025-08-20 13:52:35.543009  |  loss: 3.8041751384735107
+[METRICS (1 step stale)] step: 359  |  time: 2025-08-20 13:52:38.613007  |  loss: 3.7829675674438477
+[MESSAGE] Running validation for step 375...
+[METRICS (1 step stale)] step: 369  |  time: 2025-08-20 13:52:41.681485  |  loss: 3.8893344402313232
+[MESSAGE] Validation finished for step 375.
+[METRICS (1 step stale)] step: 375  |  val_loss: 3.8263344764709473
+[METRICS (1 step stale)] step: 379  |  time: 2025-08-20 13:52:50.273122  |  loss: 3.8724312782287598
+[METRICS (1 step stale)] step: 389  |  time: 2025-08-20 13:52:51.489860  |  loss: 3.8755533695220947
+[METRICS (1 step stale)] step: 399  |  time: 2025-08-20 13:52:52.716833  |  loss: 3.859685182571411
+[METRICS (1 step stale)] step: 409  |  time: 2025-08-20 13:52:55.786368  |  loss: 3.8463704586029053
+[METRICS (1 step stale)] step: 419  |  time: 2025-08-20 13:52:58.854976  |  loss: 3.8484466075897217
+[METRICS (1 step stale)] step: 429  |  time: 2025-08-20 13:53:01.924491  |  loss: 3.7746026515960693
+[METRICS (1 step stale)] step: 439  |  time: 2025-08-20 13:53:04.994403  |  loss: 3.8191089630126953
+[METRICS (1 step stale)] step: 449  |  time: 2025-08-20 13:53:08.063666  |  loss: 3.818345546722412
+[METRICS (1 step stale)] step: 459  |  time: 2025-08-20 13:53:11.133400  |  loss: 3.7937140464782715
+[METRICS (1 step stale)] step: 469  |  time: 2025-08-20 13:53:14.203035  |  loss: 3.801438570022583
+[METRICS (1 step stale)] step: 479  |  time: 2025-08-20 13:53:17.272227  |  loss: 3.7843170166015625
+[METRICS (1 step stale)] step: 489  |  time: 2025-08-20 13:53:20.341485  |  loss: 3.7632782459259033
+[MESSAGE] Running validation for step 500...
+[METRICS (1 step stale)] step: 499  |  time: 2025-08-20 13:53:23.410766  |  loss: 3.790884256362915
+[MESSAGE] Validation finished for step 500.
+[METRICS (1 step stale)] step: 500  |  val_loss: 3.7325398921966553
+[METRICS (1 step stale)] step: 509  |  time: 2025-08-20 13:53:30.653156  |  loss: 3.772469997406006
+[METRICS (1 step stale)] step: 519  |  time: 2025-08-20 13:53:31.683826  |  loss: 3.7651329040527344
+[METRICS (1 step stale)] step: 529  |  time: 2025-08-20 13:53:34.445748  |  loss: 3.792227268218994
+[METRICS (1 step stale)] step: 539  |  time: 2025-08-20 13:53:37.515855  |  loss: 3.8172860145568848
+[METRICS (1 step stale)] step: 549  |  time: 2025-08-20 13:53:40.585061  |  loss: 3.6823465824127197
+[METRICS (1 step stale)] step: 559  |  time: 2025-08-20 13:53:43.654424  |  loss: 3.7520127296447754
+[METRICS (1 step stale)] step: 569  |  time: 2025-08-20 13:53:46.723531  |  loss: 3.747046709060669
+[METRICS (1 step stale)] step: 579  |  time: 2025-08-20 13:53:49.792985  |  loss: 3.7283899784088135
+[METRICS (1 step stale)] step: 589  |  time: 2025-08-20 13:53:52.861550  |  loss: 3.7660343647003174
+[METRICS (1 step stale)] step: 599  |  time: 2025-08-20 13:53:55.930789  |  loss: 3.7520663738250732
+[METRICS (1 step stale)] step: 609  |  time: 2025-08-20 13:53:59.000146  |  loss: 3.697028636932373
+[MESSAGE] Running validation for step 625...
+[METRICS (1 step stale)] step: 619  |  time: 2025-08-20 13:54:02.069577  |  loss: 3.7264294624328613
+[MESSAGE] Validation finished for step 625.
+[METRICS (1 step stale)] step: 625  |  val_loss: 3.649327039718628
+[METRICS (1 step stale)] step: 629  |  time: 2025-08-20 13:54:10.659129  |  loss: 3.660844564437866
+[METRICS (1 step stale)] step: 639  |  time: 2025-08-20 13:54:11.875259  |  loss: 3.7046656608581543
+[METRICS (1 step stale)] step: 649  |  time: 2025-08-20 13:54:13.102835  |  loss: 3.7377099990844727
+[METRICS (1 step stale)] step: 659  |  time: 2025-08-20 13:54:16.171866  |  loss: 3.7365329265594482
+[METRICS (1 step stale)] step: 669  |  time: 2025-08-20 13:54:19.240802  |  loss: 3.6864848136901855
+[METRICS (1 step stale)] step: 679  |  time: 2025-08-20 13:54:22.309079  |  loss: 3.6769893169403076
+[METRICS (1 step stale)] step: 689  |  time: 2025-08-20 13:54:25.378479  |  loss: 3.608036518096924
+[METRICS (1 step stale)] step: 699  |  time: 2025-08-20 13:54:28.447790  |  loss: 3.6322433948516846
+[METRICS (1 step stale)] step: 709  |  time: 2025-08-20 13:54:31.516965  |  loss: 3.6722989082336426
+[METRICS (1 step stale)] step: 719  |  time: 2025-08-20 13:54:34.584991  |  loss: 3.667214870452881
+[METRICS (1 step stale)] step: 729  |  time: 2025-08-20 13:54:37.654068  |  loss: 3.652181386947632
+[METRICS (1 step stale)] step: 739  |  time: 2025-08-20 13:54:40.722094  |  loss: 3.6320765018463135
+[MESSAGE] Running validation for step 750...
+[METRICS (1 step stale)] step: 749  |  time: 2025-08-20 13:54:43.792237  |  loss: 3.6550650596618652
+[MESSAGE] Validation finished for step 750.
+[METRICS (1 step stale)] step: 750  |  val_loss: 3.5913608074188232
+[METRICS (1 step stale)] step: 759  |  time: 2025-08-20 13:54:51.034807  |  loss: 3.6236650943756104
+[METRICS (1 step stale)] step: 769  |  time: 2025-08-20 13:54:52.064710  |  loss: 3.660318613052368
+[METRICS (1 step stale)] step: 779  |  time: 2025-08-20 13:54:54.827199  |  loss: 3.630045175552368
+[METRICS (1 step stale)] step: 789  |  time: 2025-08-20 13:54:57.896864  |  loss: 3.5981388092041016
+[METRICS (1 step stale)] step: 799  |  time: 2025-08-20 13:55:00.965673  |  loss: 3.6450397968292236
+[METRICS (1 step stale)] step: 809  |  time: 2025-08-20 13:55:04.034738  |  loss: 3.604555130004883
+[METRICS (1 step stale)] step: 819  |  time: 2025-08-20 13:55:07.103554  |  loss: 3.6314570903778076
+[METRICS (1 step stale)] step: 829  |  time: 2025-08-20 13:55:10.172477  |  loss: 3.5898005962371826
+[METRICS (1 step stale)] step: 839  |  time: 2025-08-20 13:55:13.974459  |  loss: 3.5569725036621094
+[METRICS (1 step stale)] step: 849  |  time: 2025-08-20 13:55:16.310128  |  loss: 3.560964584350586
+[METRICS (1 step stale)] step: 859  |  time: 2025-08-20 13:55:19.612542  |  loss: 3.501368522644043
+[MESSAGE] Running validation for step 875...
+[METRICS (1 step stale)] step: 869  |  time: 2025-08-20 13:55:23.844602  |  loss: 3.5661191940307617
+[MESSAGE] Validation finished for step 875.
+[METRICS (1 step stale)] step: 875  |  val_loss: 3.5382885932922363
+[METRICS (1 step stale)] step: 879  |  time: 2025-08-20 13:55:35.469705  |  loss: 3.5392282009124756
+[METRICS (1 step stale)] step: 889  |  time: 2025-08-20 13:55:36.684914  |  loss: 3.6375319957733154
+[METRICS (1 step stale)] step: 899  |  time: 2025-08-20 13:55:38.377884  |  loss: 3.5591230392456055
+[METRICS (1 step stale)] step: 909  |  time: 2025-08-20 13:55:42.611677  |  loss: 3.511077880859375
+[METRICS (1 step stale)] step: 919  |  time: 2025-08-20 13:55:46.843374  |  loss: 3.560610771179199
+[METRICS (1 step stale)] step: 929  |  time: 2025-08-20 13:55:51.076039  |  loss: 3.51541805267334
+[METRICS (1 step stale)] step: 939  |  time: 2025-08-20 13:55:55.306844  |  loss: 3.4899306297302246
+[METRICS (1 step stale)] step: 949  |  time: 2025-08-20 13:55:59.540829  |  loss: 3.5559613704681396
+[METRICS (1 step stale)] step: 959  |  time: 2025-08-20 13:56:03.773436  |  loss: 3.5266826152801514
+[METRICS (1 step stale)] step: 969  |  time: 2025-08-20 13:56:08.007206  |  loss: 3.518746852874756
+[METRICS (1 step stale)] step: 979  |  time: 2025-08-20 13:56:12.242955  |  loss: 3.5214052200317383
+[METRICS (1 step stale)] step: 989  |  time: 2025-08-20 13:56:16.474534  |  loss: 3.5675082206726074
+[MESSAGE] Running validation for step 1000...
+[METRICS (1 step stale)] step: 999  |  time: 2025-08-20 13:56:20.709770  |  loss: 3.542637348175049
+[MESSAGE] Validation finished for step 1000.
+[METRICS (1 step stale)] step: 1000  |  val_loss: 3.497018814086914
+[METRICS (1 step stale)] step: 1009  |  time: 2025-08-20 13:56:30.394738  |  loss: 3.560560464859009
+[METRICS (1 step stale)] step: 1019  |  time: 2025-08-20 13:56:31.424571  |  loss: 3.4775853157043457
+[METRICS (1 step stale)] step: 1029  |  time: 2025-08-20 13:56:35.234030  |  loss: 3.497446060180664
+[METRICS (1 step stale)] step: 1039  |  time: 2025-08-20 13:56:39.466425  |  loss: 3.7506730556488037
+[METRICS (1 step stale)] step: 1049  |  time: 2025-08-20 13:56:43.699382  |  loss: 3.553964138031006
+[METRICS (1 step stale)] step: 1059  |  time: 2025-08-20 13:56:47.932835  |  loss: 3.463603973388672
+[METRICS (1 step stale)] step: 1069  |  time: 2025-08-20 13:56:52.164625  |  loss: 3.4607086181640625
+[METRICS (1 step stale)] step: 1079  |  time: 2025-08-20 13:56:56.404581  |  loss: 3.5184004306793213
+[METRICS (1 step stale)] step: 1089  |  time: 2025-08-20 13:57:00.638680  |  loss: 3.475104570388794
+[METRICS (1 step stale)] step: 1099  |  time: 2025-08-20 13:57:04.872200  |  loss: 3.4671080112457275
+[METRICS (1 step stale)] step: 1109  |  time: 2025-08-20 13:57:09.101193  |  loss: 3.5727367401123047
+[MESSAGE] Running validation for step 1125...
+[METRICS (1 step stale)] step: 1119  |  time: 2025-08-20 13:57:13.337652  |  loss: 3.5693674087524414
+[MESSAGE] Validation finished for step 1125.
+[METRICS (1 step stale)] step: 1125  |  val_loss: 3.448789358139038
+[METRICS (1 step stale)] step: 1129  |  time: 2025-08-20 13:57:24.955096  |  loss: 3.4653639793395996
+[METRICS (1 step stale)] step: 1139  |  time: 2025-08-20 13:57:26.171979  |  loss: 3.4399702548980713
+[METRICS (1 step stale)] step: 1149  |  time: 2025-08-20 13:57:27.864129  |  loss: 3.558744430541992
+[METRICS (1 step stale)] step: 1159  |  time: 2025-08-20 13:57:32.100953  |  loss: 3.5004079341888428
+[METRICS (1 step stale)] step: 1169  |  time: 2025-08-20 13:57:36.332562  |  loss: 3.474762439727783
+[METRICS (1 step stale)] step: 1179  |  time: 2025-08-20 13:57:40.567678  |  loss: 3.4206159114837646
+[METRICS (1 step stale)] step: 1189  |  time: 2025-08-20 13:57:44.799589  |  loss: 3.4221444129943848
+[METRICS (1 step stale)] step: 1199  |  time: 2025-08-20 13:57:49.032921  |  loss: 3.409047842025757
+[METRICS (1 step stale)] step: 1209  |  time: 2025-08-20 13:57:53.267073  |  loss: 3.446755886077881
+[METRICS (1 step stale)] step: 1219  |  time: 2025-08-20 13:57:57.499798  |  loss: 3.4224650859832764
+[METRICS (1 step stale)] step: 1229  |  time: 2025-08-20 13:58:01.735303  |  loss: 3.3683292865753174
+[METRICS (1 step stale)] step: 1239  |  time: 2025-08-20 13:58:05.969270  |  loss: 3.442624807357788
+[MESSAGE] Running validation for step 1250...
+[METRICS (1 step stale)] step: 1249  |  time: 2025-08-20 13:58:10.203225  |  loss: 3.367388963699341
+[MESSAGE] Validation finished for step 1250.
+[METRICS (1 step stale)] step: 1250  |  val_loss: 3.397667646408081
+[METRICS (1 step stale)] step: 1259  |  time: 2025-08-20 13:58:19.896055  |  loss: 3.4043309688568115
+[METRICS (1 step stale)] step: 1269  |  time: 2025-08-20 13:58:20.924574  |  loss: 3.3819515705108643
+[METRICS (1 step stale)] step: 1279  |  time: 2025-08-20 13:58:24.737422  |  loss: 3.3692402839660645
+[METRICS (1 step stale)] step: 1289  |  time: 2025-08-20 13:58:28.971952  |  loss: 3.447669267654419
+[METRICS (1 step stale)] step: 1299  |  time: 2025-08-20 13:58:33.209369  |  loss: 3.479482412338257
+[METRICS (1 step stale)] step: 1309  |  time: 2025-08-20 13:58:37.444948  |  loss: 3.359408140182495
+[METRICS (1 step stale)] step: 1319  |  time: 2025-08-20 13:58:41.681583  |  loss: 3.440824270248413
+[METRICS (1 step stale)] step: 1329  |  time: 2025-08-20 13:58:45.916973  |  loss: 3.338726758956909
+[METRICS (1 step stale)] step: 1339  |  time: 2025-08-20 13:58:50.152896  |  loss: 3.4674599170684814
+[METRICS (1 step stale)] step: 1349  |  time: 2025-08-20 13:58:54.383599  |  loss: 3.3167357444763184
+[METRICS (1 step stale)] step: 1359  |  time: 2025-08-20 13:58:58.616920  |  loss: 3.3100430965423584
+[MESSAGE] Running validation for step 1375...
+[METRICS (1 step stale)] step: 1369  |  time: 2025-08-20 13:59:02.851478  |  loss: 3.362697124481201
+[MESSAGE] Validation finished for step 1375.
+[METRICS (1 step stale)] step: 1375  |  val_loss: 3.35252046585083
+[METRICS (1 step stale)] step: 1379  |  time: 2025-08-20 13:59:14.478478  |  loss: 3.396247625350952
+[METRICS (1 step stale)] step: 1389  |  time: 2025-08-20 13:59:15.692602  |  loss: 3.3447999954223633
+[METRICS (1 step stale)] step: 1399  |  time: 2025-08-20 13:59:17.387808  |  loss: 3.389324188232422
+[METRICS (1 step stale)] step: 1409  |  time: 2025-08-20 13:59:21.624988  |  loss: 3.3342318534851074
+[METRICS (1 step stale)] step: 1419  |  time: 2025-08-20 13:59:25.859846  |  loss: 3.3981213569641113
+[METRICS (1 step stale)] step: 1429  |  time: 2025-08-20 13:59:30.091816  |  loss: 3.3394150733947754
+[METRICS (1 step stale)] step: 1439  |  time: 2025-08-20 13:59:34.326004  |  loss: 3.3047027587890625
+[METRICS (1 step stale)] step: 1449  |  time: 2025-08-20 13:59:38.562969  |  loss: 3.317003011703491
+[METRICS (1 step stale)] step: 1459  |  time: 2025-08-20 13:59:42.798248  |  loss: 3.375948190689087
+[METRICS (1 step stale)] step: 1469  |  time: 2025-08-20 13:59:47.031706  |  loss: 3.319119453430176
+[METRICS (1 step stale)] step: 1479  |  time: 2025-08-20 13:59:51.266632  |  loss: 3.3129196166992188
+[METRICS (1 step stale)] step: 1489  |  time: 2025-08-20 13:59:55.496505  |  loss: 3.2776339054107666
+[MESSAGE] Running validation for step 1500...
+[METRICS (1 step stale)] step: 1499  |  time: 2025-08-20 13:59:59.731467  |  loss: 3.245753288269043
+[MESSAGE] Validation finished for step 1500.
+[METRICS (1 step stale)] step: 1500  |  val_loss: 3.3116257190704346
+[METRICS (1 step stale)] step: 1509  |  time: 2025-08-20 14:00:09.419534  |  loss: 3.2631149291992188
+[METRICS (1 step stale)] step: 1519  |  time: 2025-08-20 14:00:10.448179  |  loss: 3.3242125511169434
+[METRICS (1 step stale)] step: 1529  |  time: 2025-08-20 14:00:14.257816  |  loss: 3.3455348014831543
+[METRICS (1 step stale)] step: 1539  |  time: 2025-08-20 14:00:18.490213  |  loss: 3.312182664871216
+[METRICS (1 step stale)] step: 1549  |  time: 2025-08-20 14:00:22.721110  |  loss: 3.277139663696289
+[METRICS (1 step stale)] step: 1559  |  time: 2025-08-20 14:00:26.955341  |  loss: 3.30891752243042
+[METRICS (1 step stale)] step: 1569  |  time: 2025-08-20 14:00:31.193679  |  loss: 3.2312824726104736
+[METRICS (1 step stale)] step: 1579  |  time: 2025-08-20 14:00:35.422963  |  loss: 3.299146890640259
+[METRICS (1 step stale)] step: 1589  |  time: 2025-08-20 14:00:39.652532  |  loss: 3.3006279468536377
+[METRICS (1 step stale)] step: 1599  |  time: 2025-08-20 14:00:43.884421  |  loss: 3.3266823291778564
+[METRICS (1 step stale)] step: 1609  |  time: 2025-08-20 14:00:48.115959  |  loss: 3.2253568172454834
+[MESSAGE] Running validation for step 1625...
+[METRICS (1 step stale)] step: 1619  |  time: 2025-08-20 14:00:52.352488  |  loss: 3.4040253162384033
+[MESSAGE] Validation finished for step 1625.
+[METRICS (1 step stale)] step: 1625  |  val_loss: 3.2820873260498047
+[METRICS (1 step stale)] step: 1629  |  time: 2025-08-20 14:01:03.965982  |  loss: 3.2963802814483643
+[METRICS (1 step stale)] step: 1639  |  time: 2025-08-20 14:01:05.180357  |  loss: 3.3082056045532227
+[METRICS (1 step stale)] step: 1649  |  time: 2025-08-20 14:01:06.876225  |  loss: 3.264956474304199
+[METRICS (1 step stale)] step: 1659  |  time: 2025-08-20 14:01:11.107810  |  loss: 3.2650082111358643
+[METRICS (latest)] step: 1669  |  time: 2025-08-20 14:01:15.339523  |  loss: 3.258247137069702
+[MESSAGE] Final validation
+[MESSAGE] Running validation for step 1674...
+[MESSAGE] Validation finished for step 1674.
+[METRICS (latest)] step: 1674  |  val_loss: 3.275080919265747
+[MESSAGE] Training finished.
+[MESSAGE] Saved checkpoint to logs/7f8f89f1-d8f9-462f-98f6-1027ed9b7159//state_step001674.pkl
