@@ -1,10 +1,18 @@
+"""
+Training script for GPT in JAX - aligned with nanoGPT.
+Uses Optax AdamW optimizer with cosine learning rate schedule.
+"""
+
 import os
 import sys
 import glob
-import time
 import uuid
 import dataclasses
 import datetime
+import pickle
+import itertools
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, Optional
 
 import jax
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
@@ -14,32 +22,16 @@ jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
 
 import jax.numpy as jnp
 from jax import jit, value_and_grad
-from jax.lax import fori_loop, rsqrt, cond, scan
-from jax.random import PRNGKey, split, normal
-from jax.tree_util import (
-    tree_map,
-    tree_leaves,
-    tree_map_with_path,
-    tree_flatten,
-    tree_unflatten,
-    DictKey,
-)
-from jax.sharding import PartitionSpec as P, Mesh, NamedSharding, AxisType
-from jax.nn import initializers, relu, log_softmax
-from jax.nn import dot_product_attention
+from jax.lax import scan
+from jax.tree_util import tree_map, tree_map_with_path
+from jax.sharding import PartitionSpec as P, Mesh, NamedSharding
+
+import optax
 
 import einops
-
-import pickle
-
 import numpy as np
 
-from functools import reduce, partial
-import itertools
-
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Iterator, NamedTuple, Callable, Union, Iterable
-import collections.abc
+from model import GPTConfig, loss_fn, init_params, get_num_params
 
 PyTree = Any
 
@@ -53,243 +45,135 @@ except Exception:  # pragma: no cover
     wandb = None
 
 
-class NullLogger:
-    """Fallback logger that keeps training running when W&B isn't usable."""
-
-    def __init__(self, *args, **kwargs):
-        self.is_master = jax.process_index() == 0
-        self.prev_metrics = None
-
-    def msg(self, msg: str):
-        if not self.is_master:
-            return
-        print(msg)
-
-    def log(self, metrics: dict):
-        if not self.is_master:
-            return
-        metrics, self.prev_metrics = self.prev_metrics, metrics
-        if metrics is None:
-            return
-        metrics = "  |  ".join(list(itertools.starmap("{}: {}".format, metrics.items())))
-        print(metrics)
-
-    def flush(self):
-        if not self.is_master:
-            return
-        metrics = self.prev_metrics
-        self.prev_metrics = None
-        if metrics is None:
-            return
-        metrics = "  |  ".join(list(itertools.starmap("{}: {}".format, metrics.items())))
-        print(metrics)
-
-    def dump(self, step: int, params: PyTree, opt_state: PyTree, config):
-        # Keep the interface; training code calls this conditionally.
-        return
-
-    def finish(self):
-        return
-
-
-class WandbLogger:
-    """
-    W&B-backed drop-in replacement for the old Logger.
-
-    Keeps the "1 step stale" logging behavior to avoid forcing a device sync
-    (important for JAX performance).
-    """
+class Logger:
+    """Unified logger that handles both local printing and optional W&B logging."""
 
     def __init__(self, config):
         self.is_master = jax.process_index() == 0
-        self.prev_metrics = None
-        self.run_id = None
-        self.logdir = None
-        self.logfile = None
-        self._wandb_run = None
+        self.use_wandb = config.wandb_mode != "disabled" and self.is_master
+        self.logfile: Optional[str] = None
+        self.logdir: Optional[str] = None
+        self.run_id: Optional[str] = None
+        self._wandb_run: Optional[Any] = None
 
         if not self.is_master:
-            # Extra safety: ensure no accidental W&B init on non-master hosts.
-            os.environ.setdefault("WANDB_MODE", "disabled")
-            os.environ.setdefault("WANDB_DISABLED", "true")
-            return
-        if wandb is None:
-            raise RuntimeError(
-                "wandb is not installed (or failed to import). Install it or disable W&B."
-            )
-
-        # If we're in online mode but have no credentials available, force offline
-        # mode to avoid wandb trying to prompt for an API key (non-interactive crash).
-        mode = config.wandb_mode
-        has_env_key = bool(os.getenv("WANDB_API_KEY"))
-        has_netrc = os.path.exists(os.path.expanduser("~/.netrc"))
-        if mode == "online" and not (has_env_key or has_netrc):
-            print(
-                "[wandb] No WANDB_API_KEY and no ~/.netrc on master; falling back to WANDB_MODE=offline. "
-                "You can later sync with `wandb sync` once credentials are available."
-            )
-            mode = "offline"
-            exit()
-
-        # Initialize W&B first so we can use its run id/name for local paths.
-        wb_config = dataclasses.asdict(config)
-        try:
-            self._wandb_run = wandb.init(
-                project=config.wandb_project,
-                entity=config.wandb_entity,
-                name=config.wandb_run_name,
-                group=config.wandb_group,
-                job_type=config.wandb_job_type,
-                notes=config.wandb_notes,
-                tags=list(config.wandb_tags),
-                mode=mode,
-                config=wb_config,
-            )
-        except Exception as e:
-            # Never crash training due to logging.
-            print(f"[wandb] init failed on master ({type(e).__name__}: {e}). Disabling W&B.")
-            os.environ["WANDB_MODE"] = "disabled"
-            os.environ["WANDB_DISABLED"] = "true"
-            self.is_master = False  # disables all subsequent wandb calls
             return
 
-        # Prefer the W&B run id for log paths for easy correlation.
-        self.run_id = getattr(self._wandb_run, "id", None) or str(uuid.uuid4())
+        if self.use_wandb:
+            if wandb is None:
+                print("[wandb] wandb not installed. Disabling W&B.")
+                self.use_wandb = False
+            else:
+                mode = config.wandb_mode
+                has_env_key = bool(os.getenv("WANDB_API_KEY"))
+                has_netrc = os.path.exists(os.path.expanduser("~/.netrc"))
+                if mode == "online" and not (has_env_key or has_netrc):
+                    print("[wandb] No credentials found. Falling back to offline mode.")
+                    mode = "offline"
+
+                try:
+                    self._wandb_run = wandb.init(
+                        project=config.wandb_project,
+                        entity=config.wandb_entity,
+                        name=config.wandb_run_name,
+                        group=config.wandb_group,
+                        job_type=config.wandb_job_type,
+                        notes=config.wandb_notes,
+                        tags=list(config.wandb_tags),
+                        mode=mode,
+                        config=dataclasses.asdict(config),
+                    )
+                    self.run_id = getattr(self._wandb_run, "id", None) or str(uuid.uuid4())
+                except Exception as e:
+                    print(f"[wandb] init failed ({type(e).__name__}: {e}). Disabling W&B.")
+                    self.use_wandb = False
+
+        if self.run_id is None:
+            self.run_id = str(uuid.uuid4())
+
         self.logdir = f"logs/{self.run_id}/"
         os.makedirs(self.logdir, exist_ok=True)
         self.logfile = f"logs/{self.run_id}.txt"
 
-        # Mirror previous behavior: keep a local logfile with the full script contents.
+        # Local logfile header
         with open(self.logfile, "w") as f:
             with open(sys.argv[0]) as f2:
-                code = f2.read()
-            f.write("=" * 100 + "\n" + code + "\n" + "=" * 100 + "\n")
+                f.write("=" * 100 + "\n" + f2.read() + "\n" + "=" * 100 + "\n")
 
-        if getattr(config, "wandb_log_code", True):
+        if self.use_wandb and getattr(config, "wandb_log_code", True):
             try:
                 wandb.run.log_code(".", include_fn=lambda p: p.endswith(".py"))
             except Exception:
-                # Code logging is best-effort.
                 pass
 
     def msg(self, msg: str):
         if not self.is_master:
             return
         print(msg)
-        try:
-            wandb.termlog(str(msg))
-        except Exception:
-            pass
+        if self.use_wandb:
+            try:
+                wandb.termlog(str(msg))
+            except Exception:
+                pass
         with open(self.logfile, "a") as f:
-            f.write("[MESSAGE] " + str(msg) + "\n")
-
-    @staticmethod
-    def _sanitize_metrics(metrics: dict) -> dict:
-        out = {}
-        for k, v in metrics.items():
-            if isinstance(v, datetime.datetime):
-                out[k] = v.isoformat()
-            else:
-                out[k] = v
-        return out
+            f.write(f"[MESSAGE] {msg}\n")
 
     def log(self, metrics: dict):
         if not self.is_master:
             return
-        metrics, self.prev_metrics = self.prev_metrics, metrics
-        if metrics is None:
-            return
-        safe = self._sanitize_metrics(metrics)
-        step = safe.get("step", None)
-        try:
-            if step is not None:
-                wandb.log(safe, step=int(step))
+        
+        # Sanitize metrics
+        safe = {}
+        for k, v in metrics.items():
+            if isinstance(v, datetime.datetime):
+                safe[k] = v.isoformat()
             else:
-                wandb.log(safe)
-        except Exception:
-            # Logging should not crash training.
-            pass
-        line = "  |  ".join(list(itertools.starmap("{}: {}".format, safe.items())))
-        print(line)
-        with open(self.logfile, "a") as f:
-            f.write("[METRICS (1 step stale)] " + str(line) + "\n")
+                safe[k] = v
 
-    def flush(self):
-        if not self.is_master:
-            return
-        metrics = self.prev_metrics
-        self.prev_metrics = None
-        if metrics is None:
-            return
-        safe = self._sanitize_metrics(metrics)
-        step = safe.get("step", None)
-        try:
-            if step is not None:
-                wandb.log(safe, step=int(step))
-            else:
-                wandb.log(safe)
-        except Exception:
-            pass
-        line = "  |  ".join(list(itertools.starmap("{}: {}".format, safe.items())))
+        step = safe.get("step")
+        if self.use_wandb:
+            try:
+                if step is not None:
+                    wandb.log(safe, step=int(step))
+                else:
+                    wandb.log(safe)
+            except Exception:
+                pass
+
+        line = "  |  ".join(f"{k}: {v}" for k, v in safe.items())
         print(line)
         with open(self.logfile, "a") as f:
-            f.write("[METRICS (latest)] " + str(line) + "\n")
+            f.write(f"[METRICS] {line}\n")
 
     def dump(self, step: int, params: PyTree, opt_state: PyTree, config):
         if not self.is_master:
             return
-        params_host = jax.device_get(params)
-        opt_state_host = jax.device_get(opt_state)
-        state_to_save = {
+        state = {
             "step": step,
-            "params": params_host,
-            "opt_state": opt_state_host,
+            "params": jax.device_get(params),
+            "opt_state": jax.device_get(opt_state),
             "config": config,
         }
-        save_path = f"{self.logdir}/state_step{step:06d}.pkl"
-        with open(save_path, "wb") as f:
-            pickle.dump(state_to_save, f)
+        path = f"{self.logdir}/state_step{step:06d}.pkl"
+        with open(path, "wb") as f:
+            pickle.dump(state, f)
 
-        # Best-effort upload to W&B.
-        try:
-            wandb.save(save_path, base_path=self.logdir)
-        except Exception:
-            pass
+        if self.use_wandb:
+            try:
+                wandb.save(path, base_path=self.logdir)
+            except Exception:
+                pass
+        self.msg(f"Saved checkpoint to {path}")
 
-        self.msg(f"Saved checkpoint to {save_path}")
+    def flush(self):
+        pass  # Simplified Logger logs immediately now
 
     def finish(self):
-        if not self.is_master:
-            return
-        try:
-            wandb.finish()
-        except Exception:
-            pass
-
-
-def filter_pytree(pytree: PyTree, condition_map: Any) -> PyTree | None:
-    if condition_map is True:
-        return pytree
-    if not condition_map:
-        return None
-    if isinstance(pytree, collections.abc.Mapping) and isinstance(
-        condition_map, collections.abc.Mapping
-    ):
-        filtered_dict = {
-            k: subtree
-            for k, sub_map in condition_map.items()
-            if k in pytree
-            and (subtree := filter_pytree(pytree[k], sub_map)) is not None
-        }
-        return pytree.__class__(filtered_dict)
-    if isinstance(pytree, (list, tuple)) and isinstance(condition_map, (list, tuple)):
-        filtered_list = [
-            subtree
-            for item, sub_map in zip(pytree, condition_map)
-            if (subtree := filter_pytree(item, sub_map)) is not None
-        ]
-        return type(pytree)(filtered_list)
-    return None
+        if self.use_wandb:
+            try:
+                wandb.finish()
+            except Exception:
+                pass
 
 
 # ====================== training config =========================
@@ -297,341 +181,142 @@ def filter_pytree(pytree: PyTree, condition_map: Any) -> PyTree | None:
 
 @dataclass(kw_only=True, frozen=True)
 @jax.tree_util.register_static
-class Config:
-    # mesh
+class TrainConfig:
+    """Training configuration aligned with nanoGPT defaults."""
+
+    # Mesh / sharding
     mesh_axis_names: tuple[str, ...] = ("dp",)
     mesh_shape: tuple[int, ...] = ()
 
-    # paths
-    # input_bin: str = "fineweb10B/fineweb_train_*.bin"
-    # input_val_bin: str = "fineweb10B/fineweb_val_*.bin"
+    # Data paths
     input_bin: str = "data/openwebtext/train.bin"
     input_val_bin: str = "data/openwebtext/val.bin"
+    # Note: OWT2 has 9.0B train and 4.4M validation tokens
 
-    # wandb
-    wandb_project: str = "modded-nanogpt-jax"
-    wandb_entity: str | None = None
-    wandb_run_name: str | None = None
-    wandb_group: str | None = None
-    wandb_job_type: str | None = None
+    # W&B logging
+    wandb_project: str = "gpt-jax"
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    wandb_group: Optional[str] = None
+    wandb_job_type: Optional[str] = None
     wandb_tags: tuple[str, ...] = ()
-    wandb_notes: str | None = None
-    # "online", "offline", or "disabled"
-    wandb_mode: str = "online"
+    wandb_notes: Optional[str] = None
+    wandb_mode: str = "online"  # "online", "offline", or "disabled"
     wandb_log_code: bool = True
 
-    # iteration handling
-    n_train_iters: int = 10_000
-    n_warmup_iters: int = 0
-    f_warmdown_iters: float = 0.4
-    n_warmdown_iters: int = 0
-    val_loss_every: int = 125
-    val_tokens: int = 4434606
-    save_every: int = 0
+    # Training iterations
+    max_iters: int = 20_000  # total number of training iterations
+    warmup_iters: int = 2_000  # linear warmup steps
+    lr_decay_iters: int = max_iters - warmup_iters  # should be ~= max_iters per Chinchilla
+    eval_interval: int = 100  # evaluate every N steps
+    eval_iters: int = 8  # number of batches for evaluation (if it exceeds the dataset size, it will cycle through the dataset)
+    log_interval: int = 10  # log every N steps
+    save_every: int = 0  # save checkpoint every N steps (0 = disabled)
 
-    # input sizes
-    batch_size: int = 8 * 64  # batch size for min_sequence_length
-    micro_batch_size: int = 16
-    min_sequence_length: int = 512
-    max_sequence_length: int = 512
-    sequence_warmup_intervals: int = 1024
+    # Batch sizes (aligned with nanoGPT, but adjusted for 16-device mesh)
+    batch_size: int = 64  # micro batch size (must be divisible by num devices for this sharding)
+    gradient_accumulation_steps: int = 8  # adjusted to keep total batch size 512
+    block_size: int = 1024  # sequence length
 
-    # init
-    seed: int = 42
+    # AdamW optimizer (aligned with nanoGPT)
+    learning_rate: float = 3e-3  # max learning rate
+    min_lr: float = 1e-3 * learning_rate # min learning rate
+    weight_decay: float = 0.1
+    beta1: float = 0.9
+    beta2: float = 0.95
+    grad_clip: float = 1.0  # gradient clipping (0 = disabled)
 
-    # eps
-    adam_eps: float = 1e-10
-
-    # adam for embeddings
-    adam_embed_base_lr: float = 0.6
-    adam_embed_beta1: float = 0.9
-    adam_embed_beta2: float = 0.95
-
-    # adam for lm head
-    adam_lm_head_base_lr: float = 0.008
-    adam_lm_head_beta1: float = 0.9
-    adam_lm_head_beta2: float = 0.95
-
-    # muon for matrices
-    muon_base_lr: float = 0.04
-    muon_momentum_warmup_steps: int = 500
-    muon_warmup_momentum_init: float = 0.85
-    muon_warmup_momentum_final: float = 0.95
-    muon_ns_iters: int = 5
-    muon_eps: float = 1e-7
-
-    # adam for non-matrices
-    adam_nonmat_base_lr: float = 0.04
-    adam_nonmat_beta1: float = 0.9
-    adam_nonmat_beta2: float = 0.95
-
-    # arch
-    n_layers: int = 12
-    d_model: int = 768
-    n_heads: int = 12
-    d_head: int = 0
-    logit_softcap: float = 15.0
-    rope_base: float = 1024
+    # Model config (GPT-2 124M)
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
     vocab_size: int = 50304
-    dtype: str = "bfloat16"
+    dropout: float = 0.0
 
-    # sharding
+    # Random seed
+    seed: int = 1337
+
+    # Sharding
     weight_sharding = None
     activation_sharding = (None, "dp")
 
     def __post_init__(self):
         object.__setattr__(self, "mesh_shape", (jax.device_count(),))
-        assert self.batch_size % self.micro_batch_size == 0
 
-        object.__setattr__(
-            self, "n_warmdown_iters", int(self.n_train_iters * self.f_warmdown_iters)
+    def get_model_config(self) -> GPTConfig:
+        """Create GPTConfig from training config."""
+        return GPTConfig(
+            block_size=self.block_size,
+            vocab_size=self.vocab_size,
+            n_layer=self.n_layer,
+            n_head=self.n_head,
+            n_embd=self.n_embd,
+            dropout=self.dropout,
         )
-        assert self.d_model % self.n_heads == 0
-        object.__setattr__(self, "d_head", self.d_model // self.n_heads)
-        assert self.n_layers % 2 == 0
 
 
-def get_mesh(config: Config):
-    mesh = jax.make_mesh(config.mesh_shape, config.mesh_axis_names)
-    return mesh
+def get_mesh(config: TrainConfig) -> Mesh:
+    return jax.make_mesh(config.mesh_shape, config.mesh_axis_names)
 
 
-# ====================== optimizers ==================
+# ====================== optimizer ==================
 
 
-class Optimizer(NamedTuple):
-    init: Callable
-    update: Callable
-
-
-def get_lr(it, n_warmup_iters, n_warmdown_iters, n_train_iters):
-    warmup_lr = (it + 1) / n_warmup_iters
-    constant_lr = 1.0
-    warmdown_lr = (n_train_iters - it) / n_warmdown_iters * (1.0 - 0.1) + 0.1
-    lr = jnp.where(
-        it < n_warmup_iters,
-        warmup_lr,
-        jnp.where(it < n_train_iters - n_warmdown_iters, constant_lr, warmdown_lr),
+def get_lr_schedule(config: TrainConfig) -> optax.Schedule:
+    """Cosine decay learning rate schedule with linear warmup."""
+    return optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=config.learning_rate,
+        warmup_steps=config.warmup_iters,
+        decay_steps=config.lr_decay_iters,
+        end_value=config.min_lr,
     )
-    return lr
 
 
-def adam(
-    base_lr: float,
-    b1: float,
-    b2: float,
-    n_warmup_iters: int,
-    n_warmdown_iters: int,
-    n_train_iters: int,
-    adam_eps: float,
-):
+def create_optimizer(config: TrainConfig) -> optax.GradientTransformation:
+    """
+    Create AdamW optimizer with cosine learning rate schedule and warmup.
+    Aligned with nanoGPT optimizer configuration.
+    """
+    lr_schedule = get_lr_schedule(config)
 
-    def init(params):
-        m = tree_map(jnp.zeros_like, params)
-        v = tree_map(jnp.zeros_like, params)
-        step = jnp.array(0, dtype=jnp.int32)
-        return {"m": m, "v": v, "step": step}
+    # Build optimizer chain
+    components = []
 
-    def update(grads, params, state):
-        step = state["step"] + 1
-        lr = base_lr * get_lr(
-            state["step"], n_warmup_iters, n_warmdown_iters, n_train_iters
+    # Gradient clipping (if enabled) - uses global norm clipping like nanoGPT
+    if config.grad_clip > 0:
+        components.append(optax.clip_by_global_norm(config.grad_clip))
+
+    # AdamW with weight decay applied only to 2D+ parameters (weight matrices)
+    # LayerNorm scales (1D) don't get weight decay, matching nanoGPT behavior
+    def weight_decay_mask(params):
+        def should_decay(path, leaf):
+            return leaf.ndim >= 2
+        return tree_map_with_path(should_decay, params)
+
+    components.append(
+        optax.adamw(
+            learning_rate=lr_schedule,
+            b1=config.beta1,
+            b2=config.beta2,
+            weight_decay=config.weight_decay,
+            mask=weight_decay_mask,
         )
-        m = tree_map(
-            lambda m, g: (b1 * m + (1 - b1) * g).astype(m.dtype), state["m"], grads
-        )
-        v = tree_map(
-            lambda v, g: (b2 * v + (1 - b2) * g**2).astype(v.dtype), state["v"], grads
-        )
-        m_hat = tree_map(lambda m: (m / (1 - b1**step)).astype(m.dtype), m)
-        v_hat = tree_map(lambda v: (v / (1 - b2**step)).astype(v.dtype), v)
-        updates = tree_map(lambda m, v: lr * m / (jnp.sqrt(v) + adam_eps), m_hat, v_hat)
-        new_params = tree_map(lambda p, u: p - u.astype(p.dtype), params, updates)
-        new_state = {"m": m, "v": v, "step": step}
-        return new_params, new_state
+    )
 
-    return Optimizer(init, update)
-
-
-def zeropower_via_newtonschulz5(G, steps, eps):
-
-    assert len(G.shape) == 2
-    transpose = G.shape[0] > G.shape[1]
-
-    def _update_loop(X):
-        a, b, c = (3.4445, -4.7750, 2.0315)
-        for i in range(steps):
-            A = X @ X.T
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
-        return X
-
-    def tall_case(g):
-        X = g.T.astype(jnp.bfloat16)
-        X /= jnp.linalg.norm(X) + eps
-        X_final = _update_loop(X)
-        return X_final.T.astype(g.dtype)
-
-    def wide_case(g):
-        X = g.astype(jnp.bfloat16)
-        X /= jnp.linalg.norm(X) + eps
-        X_final = _update_loop(X)
-        return X_final.astype(g.dtype)
-
-    return cond(transpose, tall_case, wide_case, G)
-
-
-def muon(
-    base_lr: float,
-    momentum_warmup_steps: int,
-    warmup_momentum_init: float,
-    warmup_momentum_final: float,
-    n_warmup_iters: int,
-    n_warmdown_iters: int,
-    n_train_iters: int,
-    ns_iters: int,
-    eps: float,
-):
-
-    def init(params):
-        m = tree_map(jnp.zeros_like, params)
-        step = jnp.array(0, dtype=jnp.int32)
-        return {"m": m, "step": step}
-
-    def update(grads, params, state):
-        step = state["step"]
-        lr = base_lr * get_lr(step, n_warmup_iters, n_warmdown_iters, n_train_iters)
-        frac = jnp.minimum(step / momentum_warmup_steps, 1.0)
-        momentum = warmup_momentum_init + frac * (
-            warmup_momentum_final - warmup_momentum_init
-        )
-        new_m = tree_map(
-            lambda m, g: (m + (1 - momentum).astype(m.dtype) * (g - m)).astype(m.dtype),
-            state["m"],
-            grads,
-        )
-
-        def _update_leaf(g, p, m):
-            g_nesterov = g + momentum.astype(m.dtype) * (m - g)
-            update = (
-                lr.astype(p.dtype)
-                * zeropower_via_newtonschulz5(g_nesterov, ns_iters, eps).astype(p.dtype)
-                * jnp.sqrt(jnp.maximum(1.0, g.shape[0] / g.shape[1])).astype(p.dtype)
-            )
-            return p - update
-
-        new_params = tree_map(_update_leaf, grads, params, new_m)
-        new_state = {"m": new_m, "step": step + 1}
-        return new_params, new_state
-
-    return Optimizer(init, update)
-
-
-def multi_optimizer(optimizer_map: Any, **optimizers: Optimizer):
-    optimizer_names = list(optimizers.keys())
-
-    def init(params):
-        states = {}
-        for name, opt in optimizers.items():
-            is_relevant_map = tree_map(lambda label: label == name, optimizer_map)
-            params_subset = filter_pytree(params, is_relevant_map)
-            states[name] = opt.init(params_subset)
-        return states
-
-    def update(grads, params, states):
-        leaves, treedef = tree_flatten(params)
-        map_leaves, _ = tree_flatten(optimizer_map)
-        new_leaves_list = list(leaves)
-        new_states = {}
-        for name, opt in optimizers.items():
-            is_relevant_map = tree_map(lambda label: label == name, optimizer_map)
-            grads_subset = filter_pytree(grads, is_relevant_map)
-            params_subset = filter_pytree(params, is_relevant_map)
-            if not grads_subset or not tree_leaves(grads_subset):
-                new_states[name] = states[name]
-                continue
-            new_params_subset, new_states[name] = opt.update(
-                grads_subset, params_subset, states[name]
-            )
-            subset_leaves, _ = tree_flatten(new_params_subset)
-            original_indices = [
-                i for i, label in enumerate(map_leaves) if label == name
-            ]
-            assert len(subset_leaves) == len(
-                original_indices
-            ), f"Mismatch for optimizer {name}"
-            for idx, leaf_val in zip(original_indices, subset_leaves):
-                new_leaves_list[idx] = leaf_val
-        new_params = tree_unflatten(treedef, new_leaves_list)
-        return new_params, new_states
-
-    return Optimizer(init, update)
-
-
-def create_optimizer_map(params):
-    def get_label(path, leaf):
-        is_adam_embed = any(isinstance(k, DictKey) and k.key == "wte" for k in path)
-        is_adam_lm_head = any(
-            isinstance(k, DictKey) and k.key == "lm_head" for k in path
-        )
-        is_muon = (
-            any(isinstance(k, DictKey) and k.key == "h" for k in path)
-            and leaf.ndim == 2
-        )
-        is_adam_nonmat = any(
-            isinstance(k, DictKey) and k.key == "skip_weights" for k in path
-        ) or (
-            leaf.ndim < 2 and any(isinstance(k, DictKey) and k.key == "h" for k in path)
-        )
-        assert (
-            int(is_adam_embed)
-            + int(is_adam_lm_head)
-            + int(is_muon)
-            + int(is_adam_nonmat)
-            == 1
-        )
-        if is_adam_embed:
-            return "adam_embed"
-        elif is_adam_lm_head:
-            return "adam_lm_head"
-        elif is_muon:
-            return "muon"
-        else:
-            return "adam_nonmat"
-
-    return tree_map_with_path(get_label, params)
+    return optax.chain(*components)
 
 
 # ======================== dataset =============================
 
 
-def _get_shape_for_step(step: int, config: Config):
-    available_seq_lens = np.arange(
-        config.min_sequence_length,
-        config.max_sequence_length + 1,
-        config.sequence_warmup_intervals,
-    )
-    if config.max_sequence_length not in available_seq_lens:
-        available_seq_lens = np.append(available_seq_lens, config.max_sequence_length)
-    n_lens = len(available_seq_lens)
-    idx = int((step / config.n_train_iters) * n_lens)
-    current_seq_len = available_seq_lens[idx]
-    total_tokens = config.batch_size * config.min_sequence_length
-    current_B = total_tokens // current_seq_len
-    current_B = (current_B // config.micro_batch_size) * config.micro_batch_size
-    current_B = max(current_B, config.micro_batch_size)
-    current_n_grad_acc = current_B // config.micro_batch_size
-    return int(current_seq_len), int(current_B), int(current_n_grad_acc)
-
-
 def load_dataset(
-    config: Config, logger: WandbLogger, mesh: Mesh, is_training: bool
+    config: TrainConfig, logger, mesh: Mesh, is_training: bool
 ) -> Iterable[tuple[jax.Array, jax.Array]]:
+    """Load dataset from binary files."""
+
     def _describe_token_file(filename: str) -> dict[str, Any]:
-        """
-        Assumes:
-        - `.bin`: raw uint16 tokens (no header)
-        """
+        """Assumes `.bin`: raw uint16 tokens (no header)."""
         filesize = os.path.getsize(filename)
         if filesize < 2:
             raise RuntimeError(f"File too small to contain tokens: {filename}")
@@ -647,8 +332,6 @@ def load_dataset(
         }
 
     def _open_tokens_memmap(file_info: dict[str, Any]) -> np.ndarray:
-        # Recreate memmap per access to avoid the known long-run NumPy memmap
-        # memory growth issue when iterating for many batches.
         filename = file_info["filename"]
         kind = file_info["kind"]
         if kind == "bin_raw":
@@ -662,9 +345,11 @@ def load_dataset(
 
     process_rank = jax.process_index()
     num_processes = jax.process_count()
-    files = sorted(glob.glob(config.input_bin))
+
+    input_pattern = config.input_bin if is_training else config.input_val_bin
+    files = sorted(glob.glob(input_pattern))
     if not files:
-        raise RuntimeError(f"No files found for pattern {config.input_bin}")
+        raise RuntimeError(f"No files found for pattern {input_pattern}")
 
     file_infos = [_describe_token_file(f) for f in files]
     shard_lengths = np.array([fi["ntok"] for fi in file_infos], dtype=np.int64)
@@ -673,7 +358,7 @@ def load_dataset(
 
     total_bytes_on_disk = sum(os.path.getsize(f) for f in files)
     logger.msg(
-        f"Process {process_rank}/{num_processes} prepared a memmap-backed dataset "
+        f"Process {process_rank}/{num_processes} prepared dataset "
         f"from {len(files)} file(s): {total_ntok:,} tokens, {total_bytes_on_disk / 1e9:.2f} GB on disk."
     )
 
@@ -701,330 +386,79 @@ def load_dataset(
         if len(parts) == 1:
             return parts[0]
         return np.concatenate(parts, axis=0)
-    shape_schedule = []
+
+    # Fixed batch shape (no sequence warmup like original)
+    seq_len = config.block_size
+    batch_size = config.batch_size
+    n_grad_acc = config.gradient_accumulation_steps
+    tokens_per_batch = batch_size * n_grad_acc * seq_len
+
     if is_training:
-        for step in range(config.n_train_iters):
-            seq_len, B, _ = _get_shape_for_step(step, config)
-            shape_schedule.append({"seq_len": seq_len, "B": B})
-        num_global_batches = config.n_train_iters
+        num_batches = config.max_iters
     else:
-        seq_len = config.max_sequence_length
-        total_tokens = config.batch_size * config.min_sequence_length
-        batch_size = (
-            total_tokens // seq_len // config.micro_batch_size
-        ) * config.micro_batch_size
-        batch_size = max(batch_size, config.micro_batch_size)
-        total_tokens_per_batch = batch_size * seq_len
-        num_global_batches = config.val_tokens // total_tokens_per_batch
-        for _ in range(num_global_batches):
-            shape_schedule.append({"seq_len": seq_len, "B": batch_size})
+        num_batches = config.eval_iters
 
     activation_sharding = NamedSharding(mesh, P(*config.activation_sharding))
 
-    # In multi-host runs, `jax.device_put(..., NamedSharding(mesh, ...))` is a
-    # cross-host collective. Every process must call it and must provide the SAME
-    # input value; JAX will then shard it across the global mesh.
-    #
-    # So we intentionally generate the exact same batch sequence on every process.
     class _BatchLoader:
         def __len__(self) -> int:
-            return num_global_batches
+            return num_batches
 
         def __iter__(self):
             token_cursor = 0
-            for global_step_idx in range(num_global_batches):
-                shape_info = shape_schedule[global_step_idx]
-                seq_len = shape_info["seq_len"]
-                batch_size = shape_info["B"]
-                tokens_for_this_batch = batch_size * seq_len
-                n_grad_acc_steps = batch_size // config.micro_batch_size
-
+            for _ in range(num_batches):
                 start_idx = token_cursor
-                end_idx = start_idx + tokens_for_this_batch + 1
+                end_idx = start_idx + tokens_per_batch + 1
+
                 if end_idx > total_ntok:
                     if process_rank == 0:
                         logger.msg("Cycling dataset...")
                     token_cursor = 0
                     start_idx = 0
-                    end_idx = tokens_for_this_batch + 1
+                    end_idx = tokens_per_batch + 1
                     if end_idx > total_ntok:
                         raise RuntimeError(
-                            f"Not enough tokens ({total_ntok}) to form even one batch of size {tokens_for_this_batch+1}."
+                            f"Not enough tokens ({total_ntok}) to form even one batch of size {tokens_per_batch+1}."
                         )
 
                 buf = _read_token_window(start_idx, end_idx)
-                x = np.array(buf[:-1], dtype=np.int32).reshape(batch_size, seq_len)
-                y = np.array(buf[1:], dtype=np.int32).reshape(batch_size, seq_len)
-                batched_x = einops.rearrange(
-                    x, "(a b) ... -> a b ...", a=n_grad_acc_steps
-                )
-                batched_y = einops.rearrange(
-                    y, "(a b) ... -> a b ...", a=n_grad_acc_steps
-                )
+                x = np.array(buf[:-1], dtype=np.int32).reshape(n_grad_acc * batch_size, seq_len)
+                y = np.array(buf[1:], dtype=np.int32).reshape(n_grad_acc * batch_size, seq_len)
 
-                # Shard the *global* batch across the global mesh.
+                # Reshape for gradient accumulation: (n_grad_acc, batch_size, seq_len)
+                batched_x = einops.rearrange(x, "(a b) s -> a b s", a=n_grad_acc)
+                batched_y = einops.rearrange(y, "(a b) s -> a b s", a=n_grad_acc)
+
+                # Shard across mesh
                 batched_x = jax.device_put(batched_x, activation_sharding)
                 batched_y = jax.device_put(batched_y, activation_sharding)
                 yield batched_x, batched_y
 
-                token_cursor += tokens_for_this_batch
+                token_cursor += tokens_per_batch
 
     loader = _BatchLoader()
     logger.msg(
-        f"Process {process_rank}/{num_processes} prepared a lazy loader with {len(loader)} batches."
+        f"Process {process_rank}/{num_processes} prepared loader with {len(loader)} batches."
     )
     return loader
-
-
-# ======================== inits =============================
-
-
-def precompute_rope(config: Config, mesh: Mesh) -> PyTree:
-    weight_sharding = NamedSharding(mesh, P(config.weight_sharding))
-    dim = config.d_head
-    seq_len = config.max_sequence_length
-    inv_freq = 1.0 / (
-        config.rope_base ** (jnp.arange(0, dim // 4, dtype=jnp.float32) / (dim // 4))
-    )
-    inv_freq = jnp.concatenate([inv_freq, jnp.zeros_like(inv_freq)])
-    t = jnp.arange(seq_len)
-    freqs = jnp.outer(t, inv_freq)
-    cos = jnp.cos(freqs).astype(config.dtype)
-    sin = jnp.sin(freqs).astype(config.dtype)
-    precomputed_params = {}
-    precomputed_params["cos"] = jax.device_put(cos[:, None, :], weight_sharding)
-    precomputed_params["sin"] = jax.device_put(sin[:, None, :], weight_sharding)
-    return precomputed_params
-
-
-def init_params(config: Config, mesh: Mesh) -> PyTree:
-
-    weight_sharding = NamedSharding(mesh, P(config.weight_sharding))
-
-    def sharded_zeros(shape):
-        arr = jnp.zeros(shape, dtype=config.dtype)
-        return jax.device_put(arr, weight_sharding)
-
-    def sharded_ones(shape):
-        arr = jnp.ones(shape, dtype=config.dtype)
-        return jax.device_put(arr, weight_sharding)
-
-    def sharded_normal(key, shape, std):
-        arr = jax.random.normal(key, shape, dtype=config.dtype) * std
-        return jax.device_put(arr, weight_sharding)
-
-    def sharded_uniform(key, shape, bound):
-        arr = jax.random.uniform(
-            key, shape, dtype=config.dtype, minval=-bound, maxval=bound
-        )
-        return jax.device_put(arr, weight_sharding)
-
-    root_key = jax.random.key(seed=config.seed)
-    key = map(partial(jax.random.fold_in, root_key), itertools.count())
-
-    params = dict()
-    params["wte"] = sharded_normal(next(key), (config.vocab_size, config.d_model), 1.0)
-    params["h"] = []
-    params["skip_weights"] = sharded_ones(config.n_layers // 2)
-    params["lm_head"] = sharded_zeros((config.d_model, config.vocab_size))
-
-    for i in range(config.n_layers):
-        block_params = dict()
-        block_params["attn"] = dict()
-        block_params["attn"]["c_qkv"] = sharded_uniform(
-            next(key),
-            (3 * config.d_model, config.d_model),
-            (0.75 / config.d_model) ** 0.5,
-        )
-        block_params["attn"]["c_proj"] = sharded_zeros((config.d_model, config.d_model))
-        block_params["attn"]["lamb"] = jnp.array(0.5, dtype=config.dtype)
-        block_params["attn"]["scale"] = jnp.array(0.12, dtype=config.dtype)
-        block_params["mlp"] = dict()
-        block_params["mlp"]["c_fc"] = sharded_uniform(
-            next(key),
-            (config.d_model, 4 * config.d_model),
-            (0.75 / config.d_model) ** 0.5,
-        )
-        block_params["mlp"]["c_proj"] = sharded_zeros(
-            (4 * config.d_model, config.d_model)
-        )
-        lambdas_arr = jnp.array([1.0, 0.0], dtype=config.dtype)
-        block_params["lambdas"] = jax.device_put(lambdas_arr, weight_sharding)
-        params["h"].append(block_params)
-
-    precomputed_params = precompute_rope(config, mesh)
-
-    return params, precomputed_params
-
-
-def init_optimizer(config: Config, params: PyTree, mesh: Mesh):
-
-    optimizer_map = create_optimizer_map(params)
-
-    adam_embed = adam(
-        config.adam_embed_base_lr,
-        config.adam_embed_beta1,
-        config.adam_embed_beta2,
-        config.n_warmup_iters,
-        config.n_warmdown_iters,
-        config.n_train_iters,
-        config.adam_eps,
-    )
-
-    adam_lm_head = adam(
-        config.adam_lm_head_base_lr,
-        config.adam_lm_head_beta1,
-        config.adam_lm_head_beta2,
-        config.n_warmup_iters,
-        config.n_warmdown_iters,
-        config.n_train_iters,
-        config.adam_eps,
-    )
-
-    adam_nonmat = adam(
-        config.adam_nonmat_base_lr,
-        config.adam_nonmat_beta1,
-        config.adam_nonmat_beta2,
-        config.n_warmup_iters,
-        config.n_warmdown_iters,
-        config.n_train_iters,
-        config.adam_eps,
-    )
-
-    muon_opt = muon(
-        config.muon_base_lr,
-        config.muon_momentum_warmup_steps,
-        config.muon_warmup_momentum_init,
-        config.muon_warmup_momentum_final,
-        config.n_warmup_iters,
-        config.n_warmdown_iters,
-        config.n_train_iters,
-        config.muon_ns_iters,
-        config.muon_eps,
-    )
-
-    optimizer = multi_optimizer(
-        optimizer_map,
-        adam_embed=adam_embed,
-        adam_lm_head=adam_lm_head,
-        muon=muon_opt,
-        adam_nonmat=adam_nonmat,
-    )
-    opt_state = optimizer.init(params)
-
-    return optimizer, opt_state
-
-
-# ======================= model and loss =======================
-
-
-def rms_norm(x, config):
-    return x * rsqrt(
-        jnp.mean(jnp.square(x), axis=-1, keepdims=True) + jnp.finfo(x.dtype).eps
-    )
-
-
-def apply_rotary_emb(x, cos, sin):
-    d = x.shape[-1] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos - x2 * sin
-    y2 = x1 * sin + x2 * cos
-    return jnp.concatenate([y1, y2], axis=-1).astype(x.dtype)
-
-
-def linear(x, weight):
-    return jnp.einsum("...i,io->...o", x, weight.astype(x.dtype))
-
-
-def attention_forward(params, x, v1, cos, sin, config):
-    B, T, C = x.shape
-    params_qkv = einops.rearrange(
-        params["c_qkv"], "(three h d) c -> three h d c", d=config.d_head, three=3
-    )
-    q, k, v = einops.einsum(x, params_qkv, "b t c, three h d c -> three b t h d")
-    if v1 is None:
-        v1 = v
-    v = (1 - params["lamb"]) * v + params["lamb"] * v1.reshape(v.shape)
-    q = apply_rotary_emb(rms_norm(q, config), cos, sin)
-    k = apply_rotary_emb(rms_norm(k, config), cos, sin)
-    y = dot_product_attention(q, k, v, scale=params["scale"], is_causal=True).reshape(
-        B, T, C
-    )
-    y = linear(y, params["c_proj"])
-    return y, v1
-
-
-def mlp_forward(params, x):
-    x = linear(x, params["c_fc"])
-    x = relu(x) ** 2
-    x = linear(x, params["c_proj"])
-    return x
-
-
-def block_forward(params, x, v1, x0, cos, sin, config):
-    x = params["lambdas"][0] * x + params["lambdas"][1] * x0
-    x1, v1 = attention_forward(
-        params["attn"], rms_norm(x, config), v1, cos, sin, config
-    )
-    x = x + x1
-    x = x + mlp_forward(params["mlp"], rms_norm(x, config))
-    return x, v1
-
-
-def gpt_forward(params, idx, precomputed_params, config):
-    _, T = idx.shape
-    x = params["wte"][idx]
-    x = rms_norm(x, config)
-    x0 = x
-    v1 = None
-    skip_connections = []
-    n_encoder_layers = config.n_layers // 2
-    n_decoder_layers = config.n_layers - n_encoder_layers
-    cos = precomputed_params["cos"][:T, :, :]
-    sin = precomputed_params["sin"][:T, :, :]
-    for i in range(n_encoder_layers):
-        x, v1 = block_forward(params["h"][i], x, v1, x0, cos, sin, config)
-        skip_connections.append(x)
-    for i in range(n_decoder_layers):
-        x = x + params["skip_weights"][i] * skip_connections.pop()
-        x, v1 = block_forward(
-            params["h"][n_encoder_layers + i], x, v1, x0, cos, sin, config
-        )
-    x = rms_norm(x, config)
-    logits = linear(x, params["lm_head"])
-    logits = (2.0 * config.logit_softcap) * jax.nn.sigmoid(
-        logits / (config.logit_softcap / 2.0)
-    )
-    return logits.astype(jnp.float32)
-
-
-def loss_fn(params, batch, precomputed_params, config):
-    idx, labels = batch
-    logits = gpt_forward(params, idx, precomputed_params, config)
-    axis = logits.ndim - 1
-    label_logits = jnp.take_along_axis(
-        logits, jnp.expand_dims(labels, axis), axis=axis
-    ).take(0, axis=axis)
-    log_normalizers = jax.nn.logsumexp(logits, axis=axis)
-    return jnp.mean(log_normalizers - label_logits)
 
 
 # ======================== training ============================
 
 
 def train_step(
-    config: Config,
+    model_config: GPTConfig,
     params: PyTree,
-    precomputed_params: PyTree,
     opt_state: PyTree,
-    optimizer: Optimizer,
+    optimizer: optax.GradientTransformation,
     batched_x: jax.Array,
     batched_y: jax.Array,
 ) -> tuple[PyTree, PyTree, dict]:
+    """Single training step with gradient accumulation."""
     n_grad_acc_steps = batched_x.shape[0]
 
     def loss_and_grad_fn(p, micro_batch):
-        return value_and_grad(loss_fn)(p, micro_batch, precomputed_params, config)
+        return value_and_grad(loss_fn)(p, micro_batch, model_config, training=False)
 
     def micro_step(carry, micro_batch):
         accum_grads, total_loss = carry
@@ -1037,11 +471,16 @@ def train_step(
     (final_grads_accum, total_loss), _ = scan(
         micro_step, init_carry, (batched_x, batched_y)
     )
+
     avg_loss = total_loss / n_grad_acc_steps
     final_grads = tree_map(
         lambda g: (g / n_grad_acc_steps).astype(g.dtype), final_grads_accum
     )
-    new_params, new_opt_state = optimizer.update(final_grads, params, opt_state)
+
+    # Apply optimizer update
+    updates, new_opt_state = optimizer.update(final_grads, opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+
     return new_params, new_opt_state, {"loss": avg_loss}
 
 
@@ -1049,162 +488,190 @@ def eval_step(
     params: PyTree,
     batched_x: jax.Array,
     batched_y: jax.Array,
-    precomputed_params: PyTree,
-    config: Config,
+    model_config: GPTConfig,
 ) -> jax.Array:
+    """Evaluation step."""
     n_grad_acc_steps = batched_x.shape[0]
 
     def loss_loop_body(i, accumulated_loss):
         micro_batch = (batched_x[i], batched_y[i])
-        loss = loss_fn(params, micro_batch, precomputed_params, config)
+        loss = loss_fn(params, micro_batch, model_config, training=False)
         return accumulated_loss + loss
 
-    total_loss = fori_loop(0, n_grad_acc_steps, loss_loop_body, 0.0)
+    total_loss = jax.lax.fori_loop(0, n_grad_acc_steps, loss_loop_body, 0.0)
     avg_loss = total_loss / n_grad_acc_steps
     return avg_loss
 
 
 def run_evaluation(
     step: int,
-    config: Config,
     params: PyTree,
-    val_loader: Iterator,
-    precomputed_params: PyTree,
-    mesh: Mesh,
-    logger: WandbLogger,
+    val_loader,
+    logger,
     compiled_eval_fn: Callable,
 ):
+    """Run validation loop."""
     logger.msg(f"Running validation for step {step}...")
     val_loss_accum = 0.0
     val_steps = 0
     for batched_x, batched_y in val_loader:
-        loss = compiled_eval_fn(params, batched_x, batched_y, precomputed_params)
+        loss = compiled_eval_fn(params, batched_x, batched_y)
         val_loss_accum += loss
         val_steps += 1
     if val_steps == 0:
-        if step == config.val_loss_every or step >= config.n_train_iters - 1:
-            logger.msg("Warning: Validation loader was empty, no validation was run.")
+        logger.msg("Warning: Validation loader was empty, no validation was run.")
         return
     final_val_loss = val_loss_accum / val_steps
     logger.log({"step": step, "val_loss": final_val_loss})
     logger.msg(f"Validation finished for step {step}.")
 
 
-def train_loop(config: Config):
-    # Only the master host ever talks to W&B; others become no-ops.
-    try:
-        logger = WandbLogger(config)
-    except Exception as e:
-        if jax.process_index() == 0:
-            print(f"[wandb] disabled ({type(e).__name__}: {e})")
-        logger = NullLogger()
+def count_params(params: PyTree) -> dict[str, int]:
+    """Granular parameter counting for the model."""
+    counts = {"total": 0, "attn": 0, "mlp": 0, "embed": 0}
+    
+    # Token and position embeddings
+    counts["embed"] = params["wte"].size + params["wpe"].size
+    
+    # Transformer blocks
+    for block in params["h"]:
+        # Attention
+        attn_params = jax.tree_util.tree_leaves(block["attn"])
+        counts["attn"] += sum(p.size for p in attn_params)
+        
+        # MLP
+        mlp_params = jax.tree_util.tree_leaves(block["mlp"])
+        counts["mlp"] += sum(p.size for p in mlp_params)
+        
+        # LayerNorms in blocks
+        counts["total"] += block["ln_1"].size + block["ln_2"].size
+
+    counts["total"] += counts["attn"] + counts["mlp"] + counts["embed"] + params["ln_f"].size
+    return counts
+
+
+def train_loop(config: TrainConfig):
+    """Main training loop."""
+    # Initialize logger
+    logger = Logger(config)
+
     mesh = get_mesh(config)
+    model_config = config.get_model_config()
 
     with mesh:
-        params, precomputed_params = init_params(config, mesh)
-        optimizer, opt_state = init_optimizer(config, params, mesh)
+        # Initialize model parameters
+        key = jax.random.key(config.seed)
+        params = init_params(model_config, mesh, key)
 
-        # ahead of time compilation
+        # Report number of parameters
+        param_counts = count_params(params)
+        logger.msg(f"Number of parameters: {param_counts['total'] / 1e6:.2f}M")
+        
+        # Initial logging of model info
+        logger.log({
+            "model/total_params": param_counts["total"],
+            "model/attn_params": param_counts["attn"],
+            "model/mlp_params": param_counts["mlp"],
+            "model/embed_params": param_counts["embed"],
+            "model/vocab_size": model_config.vocab_size,
+        })
+
+        # Initialize optimizer
+        optimizer = create_optimizer(config)
+        opt_state = optimizer.init(params)
+        
+        # Get LR schedule for logging
+        lr_schedule = get_lr_schedule(config)
+
+        # JIT compile training and evaluation functions
         jitted_train_step = jit(
-            train_step, static_argnames=("config", "optimizer"), donate_argnums=(1, 3)
+            train_step,
+            static_argnames=("model_config", "optimizer"),
+            donate_argnums=(1, 2),
         )
-        jitted_eval_step = jit(eval_step, static_argnames=("config",))
-        logger.msg("Determining all unique training shapes...")
-        train_shapes = {
-            _get_shape_for_step(s, config) for s in range(config.n_train_iters)
-        }
-        val_config = dataclasses.replace(config, input_bin=config.input_val_bin)
-        val_seq_len = val_config.max_sequence_length
-        total_tokens = val_config.batch_size * val_config.min_sequence_length
-        val_B = (
-            total_tokens // val_seq_len // val_config.micro_batch_size
-        ) * val_config.micro_batch_size
-        val_B = max(val_B, val_config.micro_batch_size)
-        val_n_grad_acc = val_B // val_config.micro_batch_size
-        val_shape = (val_seq_len, val_B, val_n_grad_acc)
-        train_shapes.add(val_shape)
-        logger.msg("Starting Ahead-of-Time (AOT) compilation for all shapes...")
-        compiled_train_steps = {}
-        compiled_eval_fn = None
-        activation_sharding = NamedSharding(mesh, P(*config.activation_sharding))
-        for seq_len, batch_size, n_grad_acc_steps in sorted(list(train_shapes)):
-            shape_key = (seq_len, batch_size, n_grad_acc_steps)
-            logger.msg(
-                f"AOT compiling for seq_len={seq_len}, B={batch_size}, grad_acc={n_grad_acc_steps}..."
-            )
-            dummy_x_shape = (n_grad_acc_steps, config.micro_batch_size, seq_len)
-            dummy_x = jnp.zeros(dummy_x_shape, dtype=jnp.int32)
-            dummy_y = jnp.zeros_like(dummy_x)
-            dummy_x = jax.device_put(dummy_x, activation_sharding)
-            dummy_y = jax.device_put(dummy_y, activation_sharding)
-            compiled_fn = jitted_train_step.lower(
-                config,
-                params,
-                precomputed_params,
-                opt_state,
-                optimizer,
-                dummy_x,
-                dummy_y,
-            ).compile()
-            compiled_train_steps[shape_key] = compiled_fn
-            if shape_key == val_shape:
-                compiled_eval_fn = jitted_eval_step.lower(
-                    params, dummy_x, dummy_y, precomputed_params, config
-                ).compile()
-        logger.msg("AOT compilation finished for all function variants.")
+        jitted_eval_step = jit(eval_step, static_argnames=("model_config",))
 
-        # data loading
-        logger.msg("Pre-computing and loading all training batches...")
+        # AOT compile for the fixed batch shape
+        logger.msg("Starting Ahead-of-Time (AOT) compilation...")
+        activation_sharding = NamedSharding(mesh, P(*config.activation_sharding))
+        n_grad_acc = config.gradient_accumulation_steps
+        dummy_x = jnp.zeros((n_grad_acc, config.batch_size, config.block_size), dtype=jnp.int32)
+        dummy_y = jnp.zeros_like(dummy_x)
+        dummy_x = jax.device_put(dummy_x, activation_sharding)
+        dummy_y = jax.device_put(dummy_y, activation_sharding)
+
+        compiled_train_step = jitted_train_step.lower(
+            model_config,
+            params,
+            opt_state,
+            optimizer,
+            dummy_x,
+            dummy_y,
+        ).compile()
+
+        compiled_eval_step = jitted_eval_step.lower(
+            params, dummy_x, dummy_y, model_config
+        ).compile()
+        logger.msg("AOT compilation finished.")
+
+        # Load datasets
+        logger.msg("Loading training data...")
         train_batches = load_dataset(config, logger, mesh, is_training=True)
         train_loader = iter(train_batches)
-        logger.msg(f"Loaded {len(train_batches)} training batches for this process.")
-        logger.msg("Pre-computing and loading all validation batches...")
-        val_batches = load_dataset(val_config, logger, mesh, is_training=False)
-        logger.msg(f"Loaded {len(val_batches)} validation batches for this process.")
+        logger.msg(f"Loaded {len(train_batches)} training batches.")
 
+        val_config = dataclasses.replace(config, input_bin=config.input_val_bin)
+        logger.msg("Loading validation data...")
+        val_batches = load_dataset(val_config, logger, mesh, is_training=False)
+        logger.msg(f"Loaded {len(val_batches)} validation batches.")
+
+        # Training loop
         logger.msg("Starting training...")
-        for step in range(config.n_train_iters):
+
+        for step in range(config.max_iters):
             batched_x, batched_y = next(train_loader)
-            n_grad_acc, _, seq_len = batched_x.shape
-            batch_size = n_grad_acc * config.micro_batch_size
-            current_shape_key = (seq_len, batch_size, n_grad_acc)
-            aot_train_fn = compiled_train_steps[current_shape_key]
-            params, opt_state, metrics = aot_train_fn(
+
+            params, opt_state, metrics = compiled_train_step(
                 params,
-                precomputed_params,
                 opt_state,
                 batched_x,
                 batched_y,
             )
 
-            if step % 10 == 9:
-                logger.log({"step": step, "time": datetime.datetime.now()} | metrics)
-            if step > 0 and (step % config.val_loss_every == 0):
+            # Logging at the end of every step
+            if step % config.log_interval == 0:
+                current_lr = lr_schedule(step)
+                log_dict = {
+                    "step": step,
+                    "time": datetime.datetime.now(),
+                    "lr": current_lr,
+                }
+                log_dict.update(metrics)
+                logger.log(log_dict)
+
+            # Evaluation
+            if step > 0 and step % config.eval_interval == 0:
                 run_evaluation(
                     step,
-                    config,
                     params,
                     iter(val_batches),
-                    precomputed_params,
-                    mesh,
                     logger,
-                    compiled_eval_fn,
+                    compiled_eval_step,
                 )
-            if config.save_every > 0 and step > 0 and (step % config.save_every == 0):
+
+            # Checkpointing
+            if config.save_every > 0 and step > 0 and step % config.save_every == 0:
                 logger.dump(step, params, opt_state, config)
-        logger.flush()
-        logger.msg("Final validation")
+
+        # Final evaluation
+        logger.msg("Final validation...")
         run_evaluation(
             step,
-            config,
             params,
             iter(val_batches),
-            precomputed_params,
-            mesh,
             logger,
-            compiled_eval_fn,
+            compiled_eval_step,
         )
-        logger.flush()
         logger.msg("Training finished.")
         logger.dump(step, params, opt_state, config)
         logger.finish()
@@ -1214,7 +681,7 @@ if __name__ == "__main__":
     jax.distributed.initialize()
     print("Training starting...")
     print("Found", len(jax.devices()), "devices")
-    config = Config()
+    config = TrainConfig()
     print("Config:", config)
     train_loop(config)
     print("Training finished.")
