@@ -214,8 +214,8 @@ class TrainConfig:
     save_every: int = 0  # save checkpoint every N steps (0 = disabled)
 
     # Batch sizes (aligned with nanoGPT, but adjusted for 16-device mesh)
-    batch_size: int = 512  # micro batch size (must be divisible by num devices for this sharding)
-    gradient_accumulation_steps: int = 1  # adjusted to keep total batch size 512
+    batch_size: int = 64  # micro batch size (must be divisible by num devices for this sharding)
+    gradient_accumulation_steps: int = 8  # adjusted to keep total batch size 512
 
     # AdamW optimizer (aligned with nanoGPT)
     learning_rate: float = 3e-3  # max learning rate

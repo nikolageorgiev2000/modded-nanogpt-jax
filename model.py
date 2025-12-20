@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 from jax.random import PRNGKey
 from jax.sharding import PartitionSpec as P, Mesh, NamedSharding
-from jax.nn import gelu
+from jax.nn import silu
 
 PyTree = Any
 
@@ -102,7 +102,7 @@ def mlp(
 ) -> jax.Array:
     """MLP block: Linear -> GELU -> Linear -> Dropout"""
     x = linear(x, c_fc_weight)
-    x = gelu(x, approximate=True)  # PyTorch uses tanh approximation by default
+    x = silu(x)
     x = linear(x, c_proj_weight)
 
     # Dropout (only during training)
