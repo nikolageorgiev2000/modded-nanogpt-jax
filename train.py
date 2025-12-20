@@ -38,7 +38,7 @@ from functools import reduce, partial
 import itertools
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Iterator, NamedTuple, Callable, Union
+from typing import Any, Dict, List, Iterator, NamedTuple, Callable, Union, Iterable
 import collections.abc
 
 PyTree = Any
@@ -47,30 +47,23 @@ PyTree = Any
 # ======================== utils ========================
 
 
-class Logger:
-    def __init__(self):
-        self.run_id = None
-        self.logdir = None
-        self.logfile = None
+try:
+    import wandb  # type: ignore
+except Exception:  # pragma: no cover
+    wandb = None
+
+
+class NullLogger:
+    """Fallback logger that keeps training running when W&B isn't usable."""
+
+    def __init__(self, *args, **kwargs):
         self.is_master = jax.process_index() == 0
-        if not self.is_master:
-            return
-        self.run_id = str(uuid.uuid4())
-        self.logdir = f"logs/{self.run_id}/"
-        os.makedirs(self.logdir, exist_ok=True)
-        self.logfile = f"logs/{self.run_id}.txt"
         self.prev_metrics = None
-        with open(self.logfile, "w") as f:
-            with open(sys.argv[0]) as f2:
-                code = f2.read()
-            f.write("=" * 100 + "\n" + code + "\n" + "=" * 100 + "\n")
 
     def msg(self, msg: str):
         if not self.is_master:
             return
         print(msg)
-        with open(self.logfile, "a") as f:
-            f.write("[MESSAGE] " + str(msg) + "\n")
 
     def log(self, metrics: dict):
         if not self.is_master:
@@ -78,12 +71,8 @@ class Logger:
         metrics, self.prev_metrics = self.prev_metrics, metrics
         if metrics is None:
             return
-        metrics = "  |  ".join(
-            list(itertools.starmap("{}: {}".format, metrics.items()))
-        )
+        metrics = "  |  ".join(list(itertools.starmap("{}: {}".format, metrics.items())))
         print(metrics)
-        with open(self.logfile, "a") as f:
-            f.write("[METRICS (1 step stale)] " + str(metrics) + "\n")
 
     def flush(self):
         if not self.is_master:
@@ -92,12 +81,159 @@ class Logger:
         self.prev_metrics = None
         if metrics is None:
             return
-        metrics = "  |  ".join(
-            list(itertools.starmap("{}: {}".format, metrics.items()))
-        )
+        metrics = "  |  ".join(list(itertools.starmap("{}: {}".format, metrics.items())))
         print(metrics)
+
+    def dump(self, step: int, params: PyTree, opt_state: PyTree, config):
+        # Keep the interface; training code calls this conditionally.
+        return
+
+    def finish(self):
+        return
+
+
+class WandbLogger:
+    """
+    W&B-backed drop-in replacement for the old Logger.
+
+    Keeps the "1 step stale" logging behavior to avoid forcing a device sync
+    (important for JAX performance).
+    """
+
+    def __init__(self, config):
+        self.is_master = jax.process_index() == 0
+        self.prev_metrics = None
+        self.run_id = None
+        self.logdir = None
+        self.logfile = None
+        self._wandb_run = None
+
+        if not self.is_master:
+            # Extra safety: ensure no accidental W&B init on non-master hosts.
+            os.environ.setdefault("WANDB_MODE", "disabled")
+            os.environ.setdefault("WANDB_DISABLED", "true")
+            return
+        if wandb is None:
+            raise RuntimeError(
+                "wandb is not installed (or failed to import). Install it or disable W&B."
+            )
+
+        # If we're in online mode but have no credentials available, force offline
+        # mode to avoid wandb trying to prompt for an API key (non-interactive crash).
+        mode = config.wandb_mode
+        has_env_key = bool(os.getenv("WANDB_API_KEY"))
+        has_netrc = os.path.exists(os.path.expanduser("~/.netrc"))
+        if mode == "online" and not (has_env_key or has_netrc):
+            print(
+                "[wandb] No WANDB_API_KEY and no ~/.netrc on master; falling back to WANDB_MODE=offline. "
+                "You can later sync with `wandb sync` once credentials are available."
+            )
+            mode = "offline"
+            exit()
+
+        # Initialize W&B first so we can use its run id/name for local paths.
+        wb_config = dataclasses.asdict(config)
+        try:
+            self._wandb_run = wandb.init(
+                project=config.wandb_project,
+                entity=config.wandb_entity,
+                name=config.wandb_run_name,
+                group=config.wandb_group,
+                job_type=config.wandb_job_type,
+                notes=config.wandb_notes,
+                tags=list(config.wandb_tags),
+                mode=mode,
+                config=wb_config,
+            )
+        except Exception as e:
+            # Never crash training due to logging.
+            print(f"[wandb] init failed on master ({type(e).__name__}: {e}). Disabling W&B.")
+            os.environ["WANDB_MODE"] = "disabled"
+            os.environ["WANDB_DISABLED"] = "true"
+            self.is_master = False  # disables all subsequent wandb calls
+            return
+
+        # Prefer the W&B run id for log paths for easy correlation.
+        self.run_id = getattr(self._wandb_run, "id", None) or str(uuid.uuid4())
+        self.logdir = f"logs/{self.run_id}/"
+        os.makedirs(self.logdir, exist_ok=True)
+        self.logfile = f"logs/{self.run_id}.txt"
+
+        # Mirror previous behavior: keep a local logfile with the full script contents.
+        with open(self.logfile, "w") as f:
+            with open(sys.argv[0]) as f2:
+                code = f2.read()
+            f.write("=" * 100 + "\n" + code + "\n" + "=" * 100 + "\n")
+
+        if getattr(config, "wandb_log_code", True):
+            try:
+                wandb.run.log_code(".", include_fn=lambda p: p.endswith(".py"))
+            except Exception:
+                # Code logging is best-effort.
+                pass
+
+    def msg(self, msg: str):
+        if not self.is_master:
+            return
+        print(msg)
+        try:
+            wandb.termlog(str(msg))
+        except Exception:
+            pass
         with open(self.logfile, "a") as f:
-            f.write("[METRICS (latest)] " + str(metrics) + "\n")
+            f.write("[MESSAGE] " + str(msg) + "\n")
+
+    @staticmethod
+    def _sanitize_metrics(metrics: dict) -> dict:
+        out = {}
+        for k, v in metrics.items():
+            if isinstance(v, datetime.datetime):
+                out[k] = v.isoformat()
+            else:
+                out[k] = v
+        return out
+
+    def log(self, metrics: dict):
+        if not self.is_master:
+            return
+        metrics, self.prev_metrics = self.prev_metrics, metrics
+        if metrics is None:
+            return
+        safe = self._sanitize_metrics(metrics)
+        step = safe.get("step", None)
+        try:
+            if step is not None:
+                wandb.log(safe, step=int(step))
+            else:
+                wandb.log(safe)
+        except Exception:
+            # Logging should not crash training.
+            pass
+        line = "  |  ".join(list(itertools.starmap("{}: {}".format, safe.items())))
+        print(line)
+        with open(self.logfile, "a") as f:
+            f.write("[METRICS (1 step stale)] " + str(line) + "\n")
+
+    def flush(self):
+        if not self.is_master:
+            return
+        metrics = self.prev_metrics
+        self.prev_metrics = None
+        if metrics is None:
+            return
+        safe = self._sanitize_metrics(metrics)
+        step = safe.get("step", None)
+        try:
+            if step is not None:
+                wandb.log(safe, step=int(step))
+            else:
+                wandb.log(safe)
+        except Exception:
+            pass
+        line = "  |  ".join(list(itertools.starmap("{}: {}".format, safe.items())))
+        print(line)
+        with open(self.logfile, "a") as f:
+            f.write("[METRICS (latest)] " + str(line) + "\n")
 
     def dump(self, step: int, params: PyTree, opt_state: PyTree, config):
         if not self.is_master:
@@ -114,7 +250,21 @@ class Logger:
         with open(save_path, "wb") as f:
             pickle.dump(state_to_save, f)
 
+        # Best-effort upload to W&B.
+        try:
+            wandb.save(save_path, base_path=self.logdir)
+        except Exception:
+            pass
+
         self.msg(f"Saved checkpoint to {save_path}")
+
+    def finish(self):
+        if not self.is_master:
+            return
+        try:
+            wandb.finish()
+        except Exception:
+            pass
 
 
 def filter_pytree(pytree: PyTree, condition_map: Any) -> PyTree | None:
@@ -153,23 +303,37 @@ class Config:
     mesh_shape: tuple[int, ...] = ()
 
     # paths
-    input_bin: str = "fineweb10B/fineweb_train_*.bin"
-    input_val_bin: str = "fineweb10B/fineweb_val_*.bin"
+    # input_bin: str = "fineweb10B/fineweb_train_*.bin"
+    # input_val_bin: str = "fineweb10B/fineweb_val_*.bin"
+    input_bin: str = "data/openwebtext/train.bin"
+    input_val_bin: str = "data/openwebtext/val.bin"
+
+    # wandb
+    wandb_project: str = "modded-nanogpt-jax"
+    wandb_entity: str | None = None
+    wandb_run_name: str | None = None
+    wandb_group: str | None = None
+    wandb_job_type: str | None = None
+    wandb_tags: tuple[str, ...] = ()
+    wandb_notes: str | None = None
+    # "online", "offline", or "disabled"
+    wandb_mode: str = "online"
+    wandb_log_code: bool = True
 
     # iteration handling
-    n_train_iters: int = 1675
+    n_train_iters: int = 10_000
     n_warmup_iters: int = 0
     f_warmdown_iters: float = 0.4
     n_warmdown_iters: int = 0
     val_loss_every: int = 125
-    val_tokens: int = 10485760
+    val_tokens: int = 4434606
     save_every: int = 0
 
     # input sizes
     batch_size: int = 8 * 64  # batch size for min_sequence_length
     micro_batch_size: int = 16
-    min_sequence_length: int = 1024
-    max_sequence_length: int = 2048
+    min_sequence_length: int = 512
+    max_sequence_length: int = 512
     sequence_warmup_intervals: int = 1024
 
     # init
@@ -203,8 +367,8 @@ class Config:
 
     # arch
     n_layers: int = 12
-    d_model: int = 1024
-    n_heads: int = 4
+    d_model: int = 768
+    n_heads: int = 12
     d_head: int = 0
     logit_softcap: float = 15.0
     rope_base: float = 1024
@@ -461,31 +625,82 @@ def _get_shape_for_step(step: int, config: Config):
 
 
 def load_dataset(
-    config: Config, logger: Logger, mesh: Mesh, is_training: bool
-) -> List[tuple[jax.Array, jax.Array]]:
-    def _load_data_shard(filename):
-        with open(filename, "rb") as f:
-            header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
-            assert header[0] == 20240520, f"Magic number mismatch in {filename}"
-            assert header[1] == 1, f"Unsupported version in {filename}"
-            ntok = header[2]
-            tokens = np.frombuffer(f.read(), dtype=np.uint16)
-        assert len(tokens) == ntok, f"Token count mismatch in {filename}"
-        return tokens
+    config: Config, logger: WandbLogger, mesh: Mesh, is_training: bool
+) -> Iterable[tuple[jax.Array, jax.Array]]:
+    def _describe_token_file(filename: str) -> dict[str, Any]:
+        """
+        Assumes:
+        - `.bin`: raw uint16 tokens (no header)
+        """
+        filesize = os.path.getsize(filename)
+        if filesize < 2:
+            raise RuntimeError(f"File too small to contain tokens: {filename}")
+        if filesize % 2 != 0:
+            raise RuntimeError(
+                f"Expected even number of bytes for raw uint16 tokens in {filename}, got {filesize}."
+            )
+        ntok = filesize // 2
+        return {
+            "filename": filename,
+            "kind": "bin_raw",
+            "ntok": int(ntok),
+        }
+
+    def _open_tokens_memmap(file_info: dict[str, Any]) -> np.ndarray:
+        # Recreate memmap per access to avoid the known long-run NumPy memmap
+        # memory growth issue when iterating for many batches.
+        filename = file_info["filename"]
+        kind = file_info["kind"]
+        if kind == "bin_raw":
+            return np.memmap(
+                filename,
+                dtype=np.uint16,
+                mode="r",
+                shape=(int(file_info["ntok"]),),
+            )
+        raise RuntimeError(f"Unknown token file kind={kind} for {filename}")
 
     process_rank = jax.process_index()
     num_processes = jax.process_count()
     files = sorted(glob.glob(config.input_bin))
     if not files:
         raise RuntimeError(f"No files found for pattern {config.input_bin}")
+
+    file_infos = [_describe_token_file(f) for f in files]
+    shard_lengths = np.array([fi["ntok"] for fi in file_infos], dtype=np.int64)
+    shard_ends = np.cumsum(shard_lengths)
+    total_ntok = int(shard_ends[-1])
+
+    total_bytes_on_disk = sum(os.path.getsize(f) for f in files)
     logger.msg(
-        f"Process {process_rank}/{num_processes} starting data pre-loading into RAM..."
+        f"Process {process_rank}/{num_processes} prepared a memmap-backed dataset "
+        f"from {len(files)} file(s): {total_ntok:,} tokens, {total_bytes_on_disk / 1e9:.2f} GB on disk."
     )
-    all_tokens_list = [_load_data_shard(f) for f in files]
-    all_tokens = np.concatenate(all_tokens_list)
-    logger.msg(
-        f"Process {process_rank}/{num_processes} finished loading {all_tokens.nbytes / 1e9:.2f} GB of tokens."
-    )
+
+    def _read_token_window(start: int, end: int) -> np.ndarray:
+        """Read tokens in [start, end) from the virtual concatenation of shards."""
+        if start < 0 or end < 0 or end < start:
+            raise RuntimeError(f"Invalid token window: start={start}, end={end}")
+        if end > total_ntok:
+            raise RuntimeError(
+                f"Token window out of range: end={end} > total_ntok={total_ntok}"
+            )
+        if start == end:
+            return np.empty((0,), dtype=np.uint16)
+
+        parts: list[np.ndarray] = []
+        pos = start
+        while pos < end:
+            shard_idx = int(np.searchsorted(shard_ends, pos, side="right"))
+            shard_start = 0 if shard_idx == 0 else int(shard_ends[shard_idx - 1])
+            local_start = pos - shard_start
+            local_end = min(int(shard_lengths[shard_idx]), local_start + (end - pos))
+            mm = _open_tokens_memmap(file_infos[shard_idx])
+            parts.append(mm[local_start:local_end])
+            pos += local_end - local_start
+        if len(parts) == 1:
+            return parts[0]
+        return np.concatenate(parts, axis=0)
     shape_schedule = []
     if is_training:
         for step in range(config.n_train_iters):
@@ -504,46 +719,61 @@ def load_dataset(
         for _ in range(num_global_batches):
             shape_schedule.append({"seq_len": seq_len, "B": batch_size})
 
-    precomputed_batches = []
-    token_cursor = 0
     activation_sharding = NamedSharding(mesh, P(*config.activation_sharding))
-    for global_step_idx in range(num_global_batches):
-        shape_info = shape_schedule[global_step_idx]
-        tokens_for_this_batch = shape_info["B"] * shape_info["seq_len"]
-        if global_step_idx % num_processes == process_rank:
-            seq_len = shape_info["seq_len"]
-            batch_size = shape_info["B"]
-            n_grad_acc_steps = batch_size // config.micro_batch_size
-            start_idx = token_cursor
-            end_idx = start_idx + tokens_for_this_batch + 1
-            if end_idx > len(all_tokens):
-                if process_rank == 0:
-                    logger.msg("Cycling dataset...")
-                token_cursor = 0
-                start_idx = 0
-                end_idx = tokens_for_this_batch + 1
-                if end_idx > len(all_tokens):
-                    raise RuntimeError(
-                        f"Not enough tokens ({len(all_tokens)}) to form even one batch of size {tokens_for_this_batch+1}."
-                    )
-            buf = all_tokens[start_idx:end_idx]
-            x = np.array(buf[:-1], dtype=np.int32).reshape(batch_size, seq_len)
-            y = np.array(buf[1:], dtype=np.int32).reshape(batch_size, seq_len)
-            batched_x = einops.rearrange(x, "(a b) ... -> a b ...", a=n_grad_acc_steps)
-            batched_y = einops.rearrange(y, "(a b) ... -> a b ...", a=n_grad_acc_steps)
-            batched_x = jax.device_put(batched_x, activation_sharding)
-            batched_y = jax.device_put(batched_y, activation_sharding)
-            precomputed_batches.append((batched_x, batched_y))
-        token_cursor += tokens_for_this_batch
+
+    # In multi-host runs, `jax.device_put(..., NamedSharding(mesh, ...))` is a
+    # cross-host collective. Every process must call it and must provide the SAME
+    # input value; JAX will then shard it across the global mesh.
+    #
+    # So we intentionally generate the exact same batch sequence on every process.
+    class _BatchLoader:
+        def __len__(self) -> int:
+            return num_global_batches
+
+        def __iter__(self):
+            token_cursor = 0
+            for global_step_idx in range(num_global_batches):
+                shape_info = shape_schedule[global_step_idx]
+                seq_len = shape_info["seq_len"]
+                batch_size = shape_info["B"]
+                tokens_for_this_batch = batch_size * seq_len
+                n_grad_acc_steps = batch_size // config.micro_batch_size
+
+                start_idx = token_cursor
+                end_idx = start_idx + tokens_for_this_batch + 1
+                if end_idx > total_ntok:
+                    if process_rank == 0:
+                        logger.msg("Cycling dataset...")
+                    token_cursor = 0
+                    start_idx = 0
+                    end_idx = tokens_for_this_batch + 1
+                    if end_idx > total_ntok:
+                        raise RuntimeError(
+                            f"Not enough tokens ({total_ntok}) to form even one batch of size {tokens_for_this_batch+1}."
+                        )
+
+                buf = _read_token_window(start_idx, end_idx)
+                x = np.array(buf[:-1], dtype=np.int32).reshape(batch_size, seq_len)
+                y = np.array(buf[1:], dtype=np.int32).reshape(batch_size, seq_len)
+                batched_x = einops.rearrange(
+                    x, "(a b) ... -> a b ...", a=n_grad_acc_steps
+                )
+                batched_y = einops.rearrange(
+                    y, "(a b) ... -> a b ...", a=n_grad_acc_steps
+                )
+
+                # Shard the *global* batch across the global mesh.
+                batched_x = jax.device_put(batched_x, activation_sharding)
+                batched_y = jax.device_put(batched_y, activation_sharding)
+                yield batched_x, batched_y
+
+                token_cursor += tokens_for_this_batch
+
+    loader = _BatchLoader()
     logger.msg(
-        f"Process {process_rank}/{num_processes} pre-computed {len(precomputed_batches)} batches."
+        f"Process {process_rank}/{num_processes} prepared a lazy loader with {len(loader)} batches."
     )
-    if num_global_batches > 0 and not precomputed_batches:
-        raise RuntimeError(
-            f"Process {process_rank} could not create any batches. "
-            "Check data size, batch configuration, and number of processes."
-        )
-    return precomputed_batches
+    return loader
 
 
 # ======================== inits =============================
@@ -841,7 +1071,7 @@ def run_evaluation(
     val_loader: Iterator,
     precomputed_params: PyTree,
     mesh: Mesh,
-    logger: Logger,
+    logger: WandbLogger,
     compiled_eval_fn: Callable,
 ):
     logger.msg(f"Running validation for step {step}...")
@@ -861,7 +1091,13 @@ def run_evaluation(
 
 
 def train_loop(config: Config):
-    logger = Logger()
+    # Only the master host ever talks to W&B; others become no-ops.
+    try:
+        logger = WandbLogger(config)
+    except Exception as e:
+        if jax.process_index() == 0:
+            print(f"[wandb] disabled ({type(e).__name__}: {e})")
+        logger = NullLogger()
     mesh = get_mesh(config)
 
     with mesh:
@@ -971,8 +1207,14 @@ def train_loop(config: Config):
         logger.flush()
         logger.msg("Training finished.")
         logger.dump(step, params, opt_state, config)
+        logger.finish()
 
 
 if __name__ == "__main__":
+    jax.distributed.initialize()
+    print("Training starting...")
+    print("Found", len(jax.devices()), "devices")
     config = Config()
+    print("Config:", config)
     train_loop(config)
+    print("Training finished.")
