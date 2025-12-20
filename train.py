@@ -214,13 +214,12 @@ class TrainConfig:
     save_every: int = 0  # save checkpoint every N steps (0 = disabled)
 
     # Batch sizes (aligned with nanoGPT, but adjusted for 16-device mesh)
-    batch_size: int = 64  # micro batch size (must be divisible by num devices for this sharding)
-    gradient_accumulation_steps: int = 8  # adjusted to keep total batch size 512
-    block_size: int = 1024  # sequence length
+    batch_size: int = 512  # micro batch size (must be divisible by num devices for this sharding)
+    gradient_accumulation_steps: int = 1  # adjusted to keep total batch size 512
 
     # AdamW optimizer (aligned with nanoGPT)
     learning_rate: float = 3e-3  # max learning rate
-    min_lr: float = 1e-3 * learning_rate # min learning rate
+    min_lr: float = 1e-2 * learning_rate # min learning rate
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
@@ -228,8 +227,9 @@ class TrainConfig:
 
     # Model config (GPT-2 124M)
     n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
+    embd_dim: int = 768
+    head_dim: int = 64
+    block_size: int = 512  # sequence length
     vocab_size: int = 50304
     dropout: float = 0.0
 
@@ -249,8 +249,8 @@ class TrainConfig:
             block_size=self.block_size,
             vocab_size=self.vocab_size,
             n_layer=self.n_layer,
-            n_head=self.n_head,
-            n_embd=self.n_embd,
+            embd_dim=self.embd_dim,
+            head_dim=self.head_dim,
             dropout=self.dropout,
         )
 
@@ -522,8 +522,7 @@ def run_evaluation(
         logger.msg("Warning: Validation loader was empty, no validation was run.")
         return
     final_val_loss = val_loss_accum / val_steps
-    logger.log({"step": step, "val_loss": final_val_loss})
-    logger.msg(f"Validation finished for step {step}.")
+    return final_val_loss
 
 
 def count_params(params: PyTree) -> dict[str, int]:
@@ -568,13 +567,13 @@ def train_loop(config: TrainConfig):
         logger.msg(f"Number of parameters: {param_counts['total'] / 1e6:.2f}M")
         
         # Initial logging of model info
-        logger.log({
+        log_dict = {
             "model/total_params": param_counts["total"],
             "model/attn_params": param_counts["attn"],
             "model/mlp_params": param_counts["mlp"],
             "model/embed_params": param_counts["embed"],
             "model/vocab_size": model_config.vocab_size,
-        })
+        }
 
         # Initialize optimizer
         optimizer = create_optimizer(config)
@@ -631,6 +630,22 @@ def train_loop(config: TrainConfig):
         for step in range(config.max_iters):
             batched_x, batched_y = next(train_loader)
 
+            # First step we have logs from the initialization we want to keep
+            if step > 0:
+                log_dict = {}
+
+            # Evaluation
+            if step % config.eval_interval == 0:
+                val_loss = run_evaluation(
+                    step,
+                    params,
+                    iter(val_batches),
+                    logger,
+                    compiled_eval_step,
+                )
+                log_dict["val_loss"] = val_loss
+            
+            # Training
             params, opt_state, metrics = compiled_train_step(
                 params,
                 opt_state,
@@ -641,23 +656,13 @@ def train_loop(config: TrainConfig):
             # Logging at the end of every step
             if step % config.log_interval == 0:
                 current_lr = lr_schedule(step)
-                log_dict = {
+                log_dict.update({
                     "step": step,
-                    "time": datetime.datetime.now(),
                     "lr": current_lr,
-                }
-                log_dict.update(metrics)
-                logger.log(log_dict)
-
-            # Evaluation
-            if step > 0 and step % config.eval_interval == 0:
-                run_evaluation(
-                    step,
-                    params,
-                    iter(val_batches),
-                    logger,
-                    compiled_eval_step,
-                )
+                    **metrics,
+                })
+            
+            logger.log(log_dict)
 
             # Checkpointing
             if config.save_every > 0 and step > 0 and step % config.save_every == 0:

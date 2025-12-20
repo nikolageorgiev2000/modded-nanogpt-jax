@@ -27,13 +27,13 @@ class GPTConfig:
     block_size: int = 1024  # max sequence length
     vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64
     n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
+    embd_dim: int = 768
+    head_dim: int = 64
     dropout: float = 0.0  # dropout rate (0.0 = no dropout for pretraining)
 
     @property
-    def head_dim(self) -> int:
-        return self.n_embd // self.n_head
+    def n_head(self) -> int:
+        return self.embd_dim // self.head_dim
 
 
 def layer_norm(x: jax.Array, weight: jax.Array, eps: float = 1e-5) -> jax.Array:
@@ -224,11 +224,11 @@ def init_params(config: GPTConfig, mesh: Mesh, key: PRNGKey) -> PyTree:
 
     params = {}
 
-    # Token embeddings: (vocab_size, n_embd)
-    params["wte"] = sharded_normal(next(keys), (config.vocab_size, config.n_embd))
+    # Token embeddings: (vocab_size, embd_dim)
+    params["wte"] = sharded_normal(next(keys), (config.vocab_size, config.embd_dim))
 
-    # Position embeddings: (block_size, n_embd)
-    params["wpe"] = sharded_normal(next(keys), (config.block_size, config.n_embd))
+    # Position embeddings: (block_size, embd_dim)
+    params["wpe"] = sharded_normal(next(keys), (config.block_size, config.embd_dim))
 
     # Transformer blocks
     params["h"] = []
@@ -236,21 +236,21 @@ def init_params(config: GPTConfig, mesh: Mesh, key: PRNGKey) -> PyTree:
 
     for _ in range(config.n_layer):
         block_params = {
-            "ln_1": sharded_ones((config.n_embd,)),
-            "ln_2": sharded_ones((config.n_embd,)),
+            "ln_1": sharded_ones((config.embd_dim,)),
+            "ln_2": sharded_ones((config.embd_dim,)),
             "attn": {
-                "c_attn": sharded_normal(next(keys), (config.n_embd, 3 * config.n_embd)),
-                "c_proj": sharded_normal(next(keys), (config.n_embd, config.n_embd), std=residual_scale),
+                "c_attn": sharded_normal(next(keys), (config.embd_dim, 3 * config.embd_dim)),
+                "c_proj": sharded_normal(next(keys), (config.embd_dim, config.embd_dim), std=residual_scale),
             },
             "mlp": {
-                "c_fc": sharded_normal(next(keys), (config.n_embd, 4 * config.n_embd)),
-                "c_proj": sharded_normal(next(keys), (4 * config.n_embd, config.n_embd), std=residual_scale),
+                "c_fc": sharded_normal(next(keys), (config.embd_dim, 4 * config.embd_dim)),
+                "c_proj": sharded_normal(next(keys), (4 * config.embd_dim, config.embd_dim), std=residual_scale),
             },
         }
         params["h"].append(block_params)
 
     # Final layer norm
-    params["ln_f"] = sharded_ones((config.n_embd,))
+    params["ln_f"] = sharded_ones((config.embd_dim,))
 
     return params
 
