@@ -653,6 +653,10 @@ def train_loop(config: TrainConfig):
                 batched_y,
             )
 
+            # # Normalize weights
+            # params["h"][0]["mlp"]["c_fc"] = params["h"][0]["mlp"]["c_fc"] / jnp.linalg.norm(params["h"][0]["mlp"]["c_fc"], axis=0, keepdims=True)
+            # params["h"][0]["mlp"]["c_proj"] = params["h"][0]["mlp"]["c_proj"] / jnp.linalg.norm(params["h"][0]["mlp"]["c_proj"], axis=-1, keepdims=True)
+
             # Logging at the end of every step
             if step % config.log_interval == 0:
                 current_lr = lr_schedule(step)

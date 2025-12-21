@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 from jax.random import PRNGKey
 from jax.sharding import PartitionSpec as P, Mesh, NamedSharding
-from jax.nn import silu
+from jax.nn import silu, gelu, softmax
 
 PyTree = Any
 
@@ -46,7 +46,7 @@ def layer_norm(x: jax.Array, weight: jax.Array, eps: float = 1e-5) -> jax.Array:
 
 def linear(x: jax.Array, weight: jax.Array) -> jax.Array:
     """Linear layer without bias: y = x @ W"""
-    return jnp.einsum("...i,io->...o", x, weight.astype(x.dtype))
+    return x @ weight.astype(x.dtype)
 
 
 def causal_self_attention(
@@ -75,7 +75,7 @@ def causal_self_attention(
     v = v.reshape(B, T, n_head, head_dim)
 
     # Use JAX's efficient attention implementation
-    scale = 1.0 / math.sqrt(head_dim)
+    scale = config.embd_dim ** -0.5
     y = jax.nn.dot_product_attention(q, k, v, scale=scale, is_causal=True)
 
     # Reshape back: (B, T, n_head, head_dim) -> (B, T, C)
@@ -95,14 +95,16 @@ def causal_self_attention(
 def mlp(
     x: jax.Array,
     c_fc_weight: jax.Array,
+    c_fc2_weight: jax.Array,
     c_proj_weight: jax.Array,
     config: GPTConfig,
     dropout_key: Optional[PRNGKey] = None,
     training: bool = False,
 ) -> jax.Array:
-    """MLP block: Linear -> GELU -> Linear -> Dropout"""
-    x = linear(x, c_fc_weight)
-    x = silu(x)
+    """MLP block: (silu(Linear) * Linear) -> Linear -> Dropout"""
+    gate = linear(x, c_fc_weight)
+    up = linear(x, c_fc2_weight)
+    x = silu(gate) * up
     x = linear(x, c_proj_weight)
 
     # Dropout (only during training)
@@ -145,6 +147,7 @@ def block_forward(
     mlp_out = mlp(
         ln2_out,
         block_params["mlp"]["c_fc"],
+        block_params["mlp"]["c_fc2"],
         block_params["mlp"]["c_proj"],
         config,
         mlp_key,
@@ -243,8 +246,9 @@ def init_params(config: GPTConfig, mesh: Mesh, key: PRNGKey) -> PyTree:
                 "c_proj": sharded_normal(next(keys), (config.embd_dim, config.embd_dim), std=residual_scale),
             },
             "mlp": {
-                "c_fc": sharded_normal(next(keys), (config.embd_dim, 4 * config.embd_dim)),
-                "c_proj": sharded_normal(next(keys), (4 * config.embd_dim, config.embd_dim), std=residual_scale),
+                "c_fc": sharded_normal(next(keys), (config.embd_dim, int(8/3.0 * config.embd_dim))),
+                "c_fc2": sharded_normal(next(keys), (config.embd_dim, int(8/3.0 * config.embd_dim))),
+                "c_proj": sharded_normal(next(keys), (int(8/3.0 * config.embd_dim), config.embd_dim), std=residual_scale),
             },
         }
         params["h"].append(block_params)
