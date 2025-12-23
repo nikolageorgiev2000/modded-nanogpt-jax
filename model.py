@@ -30,11 +30,39 @@ class GPTConfig:
     embd_dim: int = 768
     head_dim: int = 64
     dropout: float = 0.0  # dropout rate (0.0 = no dropout for pretraining)
+    rope_base: float = 10000.0  # RoPE base frequency
+    weight_sharding: Optional[str] = None  # sharding spec for weights
 
     @property
     def n_head(self) -> int:
         return self.embd_dim // self.head_dim
 
+def precompute_rope(config: GPTConfig, mesh: Mesh = None) -> PyTree:
+    if mesh is not None:
+        weight_sharding = NamedSharding(mesh, P(config.weight_sharding))
+    else:
+        weight_sharding = None
+    dim = config.head_dim
+    seq_len = config.block_size
+    inv_freq = 1.0 / (
+        config.rope_base ** (jnp.arange(0, dim // 4, dtype=jnp.float32) / (dim // 4))
+    )
+    inv_freq = jnp.concatenate([inv_freq, jnp.zeros_like(inv_freq)])
+    t = jnp.arange(seq_len)
+    freqs = jnp.outer(t, inv_freq)
+    cos = jnp.cos(freqs).astype(jnp.bfloat16)
+    sin = jnp.sin(freqs).astype(jnp.bfloat16)
+    precomputed_params = {}
+    precomputed_params["cos"] = jax.device_put(cos[:, None, :], weight_sharding)
+    precomputed_params["sin"] = jax.device_put(sin[:, None, :], weight_sharding)
+    return precomputed_params
+
+def apply_rotary_emb(x, cos, sin):
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    y1 = x1 * cos - x2 * sin
+    y2 = x1 * sin + x2 * cos
+    return jnp.concatenate([y1, y2], axis=-1).astype(x.dtype)
 
 def layer_norm(x: jax.Array, weight: jax.Array, eps: float = 1e-5) -> jax.Array:
     """Layer normalization without bias."""
@@ -53,12 +81,14 @@ def causal_self_attention(
     x: jax.Array,
     c_attn_weight: jax.Array,
     c_proj_weight: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
     config: GPTConfig,
     dropout_key: Optional[PRNGKey] = None,
     training: bool = False,
 ) -> jax.Array:
     """
-    Causal self-attention following nanoGPT implementation.
+    Causal self-attention with RoPE positional encoding.
     Uses flash attention via jax.nn.dot_product_attention.
     """
     B, T, C = x.shape
@@ -73,6 +103,10 @@ def causal_self_attention(
     q = q.reshape(B, T, n_head, head_dim)
     k = k.reshape(B, T, n_head, head_dim)
     v = v.reshape(B, T, n_head, head_dim)
+
+    # Apply RoPE to Q and K
+    q = apply_rotary_emb(q, cos[:T], sin[:T])
+    k = apply_rotary_emb(k, cos[:T], sin[:T])
 
     # Use JAX's efficient attention implementation
     scale = config.embd_dim ** -0.5
@@ -118,6 +152,8 @@ def mlp(
 def block_forward(
     x: jax.Array,
     block_params: dict,
+    cos: jax.Array,
+    sin: jax.Array,
     config: GPTConfig,
     dropout_key: Optional[PRNGKey] = None,
     training: bool = False,
@@ -136,6 +172,8 @@ def block_forward(
         ln1_out,
         block_params["attn"]["c_attn"],
         block_params["attn"]["c_proj"],
+        cos,
+        sin,
         config,
         attn_key,
         training,
@@ -160,6 +198,7 @@ def block_forward(
 
 def gpt_forward(
     params: PyTree,
+    rope_params: PyTree,
     idx: jax.Array,
     config: GPTConfig,
     dropout_key: Optional[PRNGKey] = None,
@@ -167,7 +206,7 @@ def gpt_forward(
 ) -> jax.Array:
     """
     GPT forward pass:
-    1. Token embeddings + position embeddings
+    1. Token embeddings (RoPE applied in attention)
     2. Dropout
     3. N transformer blocks
     4. Final layer norm
@@ -176,10 +215,8 @@ def gpt_forward(
     B, T = idx.shape
     assert T <= config.block_size, f"Cannot forward sequence of length {T}, block size is only {config.block_size}"
 
-    # Token embeddings + position embeddings
-    tok_emb = params["wte"][idx]
-    pos_emb = params["wpe"][jnp.arange(T)]
-    x = tok_emb + pos_emb
+    # Token embeddings (no position embeddings - using RoPE)
+    x = params["wte"][idx]
 
     # Dropout on embeddings
     if training and config.dropout > 0 and dropout_key is not None:
@@ -187,13 +224,17 @@ def gpt_forward(
         mask = jax.random.bernoulli(drop_key, 1 - config.dropout, x.shape)
         x = jnp.where(mask, x / (1 - config.dropout), 0)
 
+    # Get RoPE cos/sin
+    cos = rope_params["cos"]
+    sin = rope_params["sin"]
+
     # Transformer blocks
     for block_params in params["h"]:
         if training and dropout_key is not None:
             dropout_key, block_key = jax.random.split(dropout_key)
         else:
             block_key = None
-        x = block_forward(x, block_params, config, block_key, training)
+        x = block_forward(x, block_params, cos, sin, config, block_key, training)
 
     # Final layer norm
     x = layer_norm(x, params["ln_f"])
@@ -204,15 +245,19 @@ def gpt_forward(
     return logits.astype(jnp.float32)
 
 
-def init_params(config: GPTConfig, mesh: Mesh, key: PRNGKey) -> PyTree:
+def init_params(config: GPTConfig, mesh: Mesh, key: PRNGKey) -> tuple[PyTree, PyTree]:
     """
     Initialize GPT parameters following nanoGPT initialization:
     - Linear weights: normal(0, 0.02)
     - Embeddings: normal(0, 0.02)
     - LayerNorm weights: ones
     - c_proj weights: scaled by 1/sqrt(2*n_layer) for residual connections
+    
+    Returns:
+        params: Learnable model parameters
+        rope_params: Precomputed RoPE cos/sin embeddings (not learned)
     """
-    weight_sharding = NamedSharding(mesh, P(None))
+    weight_sharding = NamedSharding(mesh, P(config.weight_sharding))
     dtype = jnp.bfloat16
 
     def sharded_normal(key, shape, std=0.02):
@@ -229,9 +274,6 @@ def init_params(config: GPTConfig, mesh: Mesh, key: PRNGKey) -> PyTree:
 
     # Token embeddings: (vocab_size, embd_dim)
     params["wte"] = sharded_normal(next(keys), (config.vocab_size, config.embd_dim))
-
-    # Position embeddings: (block_size, embd_dim)
-    params["wpe"] = sharded_normal(next(keys), (config.block_size, config.embd_dim))
 
     # Transformer blocks
     params["h"] = []
@@ -256,19 +298,23 @@ def init_params(config: GPTConfig, mesh: Mesh, key: PRNGKey) -> PyTree:
     # Final layer norm
     params["ln_f"] = sharded_ones((config.embd_dim,))
 
-    return params
+    # Precompute RoPE embeddings
+    rope_params = precompute_rope(config, mesh)
+
+    return params, rope_params
 
 
 def loss_fn(
     params: PyTree,
     batch: tuple[jax.Array, jax.Array],
     config: GPTConfig,
+    rope_params: PyTree,
     dropout_key: Optional[PRNGKey] = None,
     training: bool = False,
 ) -> jax.Array:
     """Cross-entropy loss for language modeling."""
     idx, targets = batch
-    logits = gpt_forward(params, idx, config, dropout_key, training)
+    logits = gpt_forward(params, rope_params, idx, config, dropout_key, training)
 
     # Cross-entropy loss
     log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -279,13 +325,10 @@ def loss_fn(
     return -jnp.mean(target_log_probs)
 
 
-def get_num_params(params: PyTree, non_embedding: bool = True) -> int:
+def get_num_params(params: PyTree) -> int:
     """
     Return the number of parameters in the model.
-    For non-embedding count (default), position embeddings are subtracted.
     Token embeddings are counted because they are weight-tied with lm_head.
+    RoPE parameters are precomputed and not learned, so not included.
     """
-    total = sum(p.size for p in jax.tree_util.tree_leaves(params))
-    if non_embedding:
-        total -= params["wpe"].size
-    return total
+    return sum(p.size for p in jax.tree_util.tree_leaves(params))

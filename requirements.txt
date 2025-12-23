@@ -4,3 +4,7 @@ einops
 jax[tpu]
 optax
 wandb
+ipynb
+jupyter
+notebook
+matplotlib

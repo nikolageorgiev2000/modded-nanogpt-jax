@@ -119,7 +119,7 @@ class Logger:
             f.write(f"[MESSAGE] {msg}\n")
 
     def log(self, metrics: dict):
-        if not self.is_master:
+        if not self.is_master or not metrics:
             return
         
         # Sanitize metrics
@@ -140,7 +140,13 @@ class Logger:
             except Exception:
                 pass
 
-        line = "  |  ".join(f"{k}: {v}" for k, v in safe.items())
+        parts = []
+        for k, v in safe.items():
+            if isinstance(v, (float, jnp.ndarray, np.ndarray)) and np.ndim(v) == 0:
+                parts.append(f"{k}: {float(v):.4g}")
+            else:
+                parts.append(f"{k}: {v}")
+        line = " | ".join(parts)
         print(line)
         with open(self.logfile, "a") as f:
             f.write(f"[METRICS] {line}\n")
@@ -232,6 +238,7 @@ class TrainConfig:
     block_size: int = 512  # sequence length
     vocab_size: int = 50304
     dropout: float = 0.0
+    rope_base: float = 10000.0  # RoPE base frequency
 
     # Random seed
     seed: int = 1337
@@ -252,6 +259,8 @@ class TrainConfig:
             embd_dim=self.embd_dim,
             head_dim=self.head_dim,
             dropout=self.dropout,
+            rope_base=self.rope_base,
+            weight_sharding=self.weight_sharding,
         )
 
 
@@ -449,6 +458,7 @@ def load_dataset(
 def train_step(
     model_config: GPTConfig,
     params: PyTree,
+    precomputed_params: PyTree,
     opt_state: PyTree,
     optimizer: optax.GradientTransformation,
     batched_x: jax.Array,
@@ -458,7 +468,7 @@ def train_step(
     n_grad_acc_steps = batched_x.shape[0]
 
     def loss_and_grad_fn(p, micro_batch):
-        return value_and_grad(loss_fn)(p, micro_batch, model_config, training=False)
+        return value_and_grad(loss_fn)(p, micro_batch, model_config, precomputed_params, training=False)
 
     def micro_step(carry, micro_batch):
         accum_grads, total_loss = carry
@@ -489,13 +499,14 @@ def eval_step(
     batched_x: jax.Array,
     batched_y: jax.Array,
     model_config: GPTConfig,
+    precomputed_params: PyTree,
 ) -> jax.Array:
     """Evaluation step."""
     n_grad_acc_steps = batched_x.shape[0]
 
     def loss_loop_body(i, accumulated_loss):
         micro_batch = (batched_x[i], batched_y[i])
-        loss = loss_fn(params, micro_batch, model_config, training=False)
+        loss = loss_fn(params, micro_batch, model_config, precomputed_params, training=False)
         return accumulated_loss + loss
 
     total_loss = jax.lax.fori_loop(0, n_grad_acc_steps, loss_loop_body, 0.0)
@@ -506,6 +517,7 @@ def eval_step(
 def run_evaluation(
     step: int,
     params: PyTree,
+    precomputed_params: PyTree,
     val_loader,
     logger,
     compiled_eval_fn: Callable,
@@ -515,7 +527,7 @@ def run_evaluation(
     val_loss_accum = 0.0
     val_steps = 0
     for batched_x, batched_y in val_loader:
-        loss = compiled_eval_fn(params, batched_x, batched_y)
+        loss = compiled_eval_fn(params, batched_x, batched_y, precomputed_params)
         val_loss_accum += loss
         val_steps += 1
     if val_steps == 0:
@@ -529,8 +541,10 @@ def count_params(params: PyTree) -> dict[str, int]:
     """Granular parameter counting for the model."""
     counts = {"total": 0, "attn": 0, "mlp": 0, "embed": 0}
     
-    # Token and position embeddings
-    counts["embed"] = params["wte"].size + params["wpe"].size
+    # Token embeddings
+    counts["embed"] = params["wte"].size
+    if "wpe" in params:
+        counts["embed"] += params["wpe"].size
     
     # Transformer blocks
     for block in params["h"]:
@@ -560,7 +574,7 @@ def train_loop(config: TrainConfig):
     with mesh:
         # Initialize model parameters
         key = jax.random.key(config.seed)
-        params = init_params(model_config, mesh, key)
+        params, precomputed_params = init_params(model_config, mesh, key)
 
         # Report number of parameters
         param_counts = count_params(params)
@@ -586,7 +600,7 @@ def train_loop(config: TrainConfig):
         jitted_train_step = jit(
             train_step,
             static_argnames=("model_config", "optimizer"),
-            donate_argnums=(1, 2),
+            donate_argnums=(1, 3), # Updated donate_argnums because params is now arg 1 and opt_state is arg 3
         )
         jitted_eval_step = jit(eval_step, static_argnames=("model_config",))
 
@@ -602,6 +616,7 @@ def train_loop(config: TrainConfig):
         compiled_train_step = jitted_train_step.lower(
             model_config,
             params,
+            precomputed_params,
             opt_state,
             optimizer,
             dummy_x,
@@ -609,7 +624,7 @@ def train_loop(config: TrainConfig):
         ).compile()
 
         compiled_eval_step = jitted_eval_step.lower(
-            params, dummy_x, dummy_y, model_config
+            params, dummy_x, dummy_y, model_config, precomputed_params
         ).compile()
         logger.msg("AOT compilation finished.")
 
@@ -639,6 +654,7 @@ def train_loop(config: TrainConfig):
                 val_loss = run_evaluation(
                     step,
                     params,
+                    precomputed_params,
                     iter(val_batches),
                     logger,
                     compiled_eval_step,
@@ -648,6 +664,7 @@ def train_loop(config: TrainConfig):
             # Training
             params, opt_state, metrics = compiled_train_step(
                 params,
+                precomputed_params,
                 opt_state,
                 batched_x,
                 batched_y,
@@ -674,16 +691,19 @@ def train_loop(config: TrainConfig):
 
         # Final evaluation
         logger.msg("Final validation...")
-        run_evaluation(
+        final_val_loss = run_evaluation(
             step,
             params,
+            precomputed_params,
             iter(val_batches),
             logger,
             compiled_eval_step,
         )
+        logger.log({"step": step, "val_loss": final_val_loss})
         logger.msg("Training finished.")
         logger.dump(step, params, opt_state, config)
         logger.finish()
+    return params
 
 
 if __name__ == "__main__":
