@@ -185,6 +185,16 @@ class Logger:
 # ====================== training config =========================
 
 
+def is_masked(config: Any) -> bool:
+    """Check if a config indicates a masked dataset (both train and val contain 'mask')."""
+    return (
+        hasattr(config, "input_bin")
+        and "mask" in config.input_bin.lower()
+        and hasattr(config, "input_val_bin")
+        and "mask" in config.input_val_bin.lower()
+    )
+
+
 @dataclass(kw_only=True, frozen=True)
 @jax.tree_util.register_static
 class TrainConfig:
@@ -247,8 +257,21 @@ class TrainConfig:
     weight_sharding = None
     activation_sharding = (None, "dp")
 
+    # Masked loss (dataset format: [chunk1][mask1][chunk2][mask2]...)
+    use_masked_loss: bool = False
+
+    @property
+    def data_has_masks(self) -> bool:
+        # needed to load data with the right shape (2, ntok)
+        return is_masked(self)
+
     def __post_init__(self):
         object.__setattr__(self, "mesh_shape", (jax.device_count(),))
+        if self.use_masked_loss:
+            assert self.data_has_masks, (
+                f"use_masked_loss=True requires data with masks (filenames containing 'mask'), "
+                f"but input paths are '{self.input_bin}' and '{self.input_val_bin}'"
+            )
 
     def get_model_config(self) -> GPTConfig:
         """Create GPTConfig from training config."""
@@ -321,8 +344,26 @@ def create_optimizer(config: TrainConfig) -> optax.GradientTransformation:
 
 def load_dataset(
     config: TrainConfig, logger, mesh: Mesh, is_training: bool
-) -> Iterable[tuple[jax.Array, jax.Array]]:
-    """Load dataset from binary files."""
+) -> Iterable[tuple[jax.Array, ...]]:
+    """Load dataset from binary files.
+    
+    Returns:
+        loader: Iterable yielding batches as either (x, y) or (x, y, mask) depending on 
+                whether the data has masks.
+    
+    Data is detected as having masks if the config indicates it (config.data_has_masks).
+    For masked data, the format is 2D array (2, ntok) where row 0 is tokens, row 1 is masks.
+    """
+    process_rank = jax.process_index()
+    num_processes = jax.process_count()
+
+    input_pattern = config.input_bin if is_training else config.input_val_bin
+    files = sorted(glob.glob(input_pattern))
+    if not files:
+        raise RuntimeError(f"No files found for pattern {input_pattern}")
+    
+    # Detect if data has masks
+    has_mask = config.data_has_masks
 
     def _describe_token_file(filename: str) -> dict[str, Any]:
         """Assumes `.bin`: raw uint16 tokens (no header)."""
@@ -333,7 +374,18 @@ def load_dataset(
             raise RuntimeError(
                 f"Expected even number of bytes for raw uint16 tokens in {filename}, got {filesize}."
             )
-        ntok = filesize // 2
+        total_elements = filesize // 2
+        
+        if has_mask:
+            # 2D array: (2, ntok) where row 0 is tokens, row 1 is masks
+            assert total_elements % 2 == 0, (
+                f"Masked data file {filename} must have even number of uint16 elements "
+                f"to form (2, N) array, got {total_elements}"
+            )
+            ntok = total_elements // 2
+        else:
+            ntok = total_elements
+        
         return {
             "filename": filename,
             "kind": "bin_raw",
@@ -344,21 +396,23 @@ def load_dataset(
         filename = file_info["filename"]
         kind = file_info["kind"]
         if kind == "bin_raw":
-            return np.memmap(
-                filename,
-                dtype=np.uint16,
-                mode="r",
-                shape=(int(file_info["ntok"]),),
-            )
+            ntok = int(file_info["ntok"])
+            if has_mask:
+                # 2D array: (2, ntok) - row 0 is tokens, row 1 is masks
+                return np.memmap(
+                    filename,
+                    dtype=np.uint16,
+                    mode="r",
+                    shape=(2, ntok),
+                )
+            else:
+                return np.memmap(
+                    filename,
+                    dtype=np.uint16,
+                    mode="r",
+                    shape=(ntok,),
+                )
         raise RuntimeError(f"Unknown token file kind={kind} for {filename}")
-
-    process_rank = jax.process_index()
-    num_processes = jax.process_count()
-
-    input_pattern = config.input_bin if is_training else config.input_val_bin
-    files = sorted(glob.glob(input_pattern))
-    if not files:
-        raise RuntimeError(f"No files found for pattern {input_pattern}")
 
     file_infos = [_describe_token_file(f) for f in files]
     shard_lengths = np.array([fi["ntok"] for fi in file_infos], dtype=np.int64)
@@ -372,7 +426,11 @@ def load_dataset(
     )
 
     def _read_token_window(start: int, end: int) -> np.ndarray:
-        """Read tokens in [start, end) from the virtual concatenation of shards."""
+        """Read tokens in [start, end) from the virtual concatenation of shards.
+        
+        For masked data (2D): returns shape (2, end - start)
+        For non-masked data (1D): returns shape (end - start,)
+        """
         if start < 0 or end < 0 or end < start:
             raise RuntimeError(f"Invalid token window: start={start}, end={end}")
         if end > total_ntok:
@@ -380,7 +438,10 @@ def load_dataset(
                 f"Token window out of range: end={end} > total_ntok={total_ntok}"
             )
         if start == end:
-            return np.empty((0,), dtype=np.uint16)
+            if has_mask:
+                return np.empty((2, 0), dtype=np.uint16)
+            else:
+                return np.empty((0,), dtype=np.uint16)
 
         parts: list[np.ndarray] = []
         pos = start
@@ -390,17 +451,20 @@ def load_dataset(
             local_start = pos - shard_start
             local_end = min(int(shard_lengths[shard_idx]), local_start + (end - pos))
             mm = _open_tokens_memmap(file_infos[shard_idx])
-            parts.append(mm[local_start:local_end])
+            if has_mask:
+                # mm shape: (2, shard_ntok), slice along token dimension
+                parts.append(mm[:, local_start:local_end])
+            else:
+                parts.append(mm[local_start:local_end])
             pos += local_end - local_start
         if len(parts) == 1:
             return parts[0]
-        return np.concatenate(parts, axis=0)
+        # Concatenate along token dimension (axis 1 for 2D, axis 0 for 1D)
+        return np.concatenate(parts, axis=1 if has_mask else 0)
 
-    # Fixed batch shape (no sequence warmup like original)
-    seq_len = config.block_size
     batch_size = config.batch_size
     n_grad_acc = config.gradient_accumulation_steps
-    tokens_per_batch = batch_size * n_grad_acc * seq_len
+    num_samples = batch_size * n_grad_acc
 
     if is_training:
         num_batches = config.max_iters
@@ -408,44 +472,68 @@ def load_dataset(
         num_batches = config.eval_iters
 
     activation_sharding = NamedSharding(mesh, P(*config.activation_sharding))
+    
+    # We read tokens_per_batch + 1 to create shifted x/y (targets)
+    seq_len = config.block_size
+    tokens_per_batch = num_samples * seq_len
 
     class _BatchLoader:
         def __len__(self) -> int:
             return num_batches
 
         def __iter__(self):
-            token_cursor = 0
+            cursor = 0
             for _ in range(num_batches):
-                start_idx = token_cursor
+                start_idx = cursor
+                # Need +1 token for the shifted target
                 end_idx = start_idx + tokens_per_batch + 1
 
                 if end_idx > total_ntok:
                     if process_rank == 0:
                         logger.msg("Cycling dataset...")
-                    token_cursor = 0
+                    cursor = 0
                     start_idx = 0
                     end_idx = tokens_per_batch + 1
                     if end_idx > total_ntok:
                         raise RuntimeError(
-                            f"Not enough tokens ({total_ntok}) to form even one batch of size {tokens_per_batch+1}."
+                            f"Not enough tokens ({total_ntok}) to form even one batch of size {end_idx}."
                         )
 
                 buf = _read_token_window(start_idx, end_idx)
-                x = np.array(buf[:-1], dtype=np.int32).reshape(n_grad_acc * batch_size, seq_len)
-                y = np.array(buf[1:], dtype=np.int32).reshape(n_grad_acc * batch_size, seq_len)
 
-                # Reshape for gradient accumulation: (n_grad_acc, batch_size, seq_len)
-                batched_x = einops.rearrange(x, "(a b) s -> a b s", a=n_grad_acc)
-                batched_y = einops.rearrange(y, "(a b) s -> a b s", a=n_grad_acc)
+                if has_mask:
+                    # buf shape: (2, tokens_per_batch + 1)
+                    chunks = buf[0]  # tokens
+                    masks = buf[1]   # masks
+                    
+                    # Create x, y, and loss_mask with length = block_size
+                    x = np.array(chunks[:-1], dtype=np.int32).reshape(num_samples, seq_len)
+                    y = np.array(chunks[1:], dtype=np.int32).reshape(num_samples, seq_len)
+                    m = np.array(masks[1:], dtype=np.float32).reshape(num_samples, seq_len)
+                    
+                    # If use_masked_loss=False, replace mask with ones to disable masking
+                    if not config.use_masked_loss:
+                        m = np.ones_like(m)
 
-                # Shard across mesh
-                batched_x = jax.device_put(batched_x, activation_sharding)
-                batched_y = jax.device_put(batched_y, activation_sharding)
-                yield batched_x, batched_y
+                    # Reshape and shard
+                    batched_x = jax.device_put(einops.rearrange(x, "(a b) s -> a b s", a=n_grad_acc), activation_sharding)
+                    batched_y = jax.device_put(einops.rearrange(y, "(a b) s -> a b s", a=n_grad_acc), activation_sharding)
+                    batched_m = jax.device_put(einops.rearrange(m, "(a b) s -> a b s", a=n_grad_acc), activation_sharding)
+                    yield batched_x, batched_y, batched_m
+                else:
+                    # buf shape: (tokens_per_batch + 1,)
+                    x = np.array(buf[:-1], dtype=np.int32).reshape(num_samples, seq_len)
+                    y = np.array(buf[1:], dtype=np.int32).reshape(num_samples, seq_len)
 
-                token_cursor += tokens_per_batch
+                    # Reshape and shard
+                    batched_x = jax.device_put(einops.rearrange(x, "(a b) s -> a b s", a=n_grad_acc), activation_sharding)
+                    batched_y = jax.device_put(einops.rearrange(y, "(a b) s -> a b s", a=n_grad_acc), activation_sharding)
+                    yield batched_x, batched_y
+
+                cursor += tokens_per_batch
 
     loader = _BatchLoader()
+
     logger.msg(
         f"Process {process_rank}/{num_processes} prepared loader with {len(loader)} batches."
     )
@@ -463,8 +551,14 @@ def train_step(
     optimizer: optax.GradientTransformation,
     batched_x: jax.Array,
     batched_y: jax.Array,
+    batched_mask: Optional[jax.Array] = None,
 ) -> tuple[PyTree, PyTree, dict]:
-    """Single training step with gradient accumulation."""
+    """Single training step with gradient accumulation.
+    
+    Args:
+        batched_mask: Optional mask array of shape (n_grad_acc, batch_size, seq_len).
+                      If provided, the loss will be computed only on masked positions.
+    """
     n_grad_acc_steps = batched_x.shape[0]
 
     def loss_and_grad_fn(p, micro_batch):
@@ -478,8 +572,15 @@ def train_step(
 
     zero_grads = tree_map(jnp.zeros_like, params)
     init_carry = (zero_grads, 0.0)
+    
+    # Build scan input tuple: (x, y) or (x, y, mask)
+    if batched_mask is not None:
+        scan_input = (batched_x, batched_y, batched_mask)
+    else:
+        scan_input = (batched_x, batched_y)
+    
     (final_grads_accum, total_loss), _ = scan(
-        micro_step, init_carry, (batched_x, batched_y)
+        micro_step, init_carry, scan_input
     )
 
     avg_loss = total_loss / n_grad_acc_steps
@@ -500,12 +601,21 @@ def eval_step(
     batched_y: jax.Array,
     model_config: GPTConfig,
     precomputed_params: PyTree,
+    batched_mask: Optional[jax.Array] = None,
 ) -> jax.Array:
-    """Evaluation step."""
+    """Evaluation step.
+    
+    Args:
+        batched_mask: Optional mask array of shape (n_grad_acc, batch_size, seq_len).
+                      If provided, the loss will be computed only on masked positions.
+    """
     n_grad_acc_steps = batched_x.shape[0]
 
     def loss_loop_body(i, accumulated_loss):
-        micro_batch = (batched_x[i], batched_y[i])
+        if batched_mask is not None:
+            micro_batch = (batched_x[i], batched_y[i], batched_mask[i])
+        else:
+            micro_batch = (batched_x[i], batched_y[i])
         loss = loss_fn(params, micro_batch, model_config, precomputed_params, training=False)
         return accumulated_loss + loss
 
@@ -521,13 +631,16 @@ def run_evaluation(
     val_loader,
     logger,
     compiled_eval_fn: Callable,
+    config: TrainConfig,
 ):
     """Run validation loop."""
     logger.msg(f"Running validation for step {step}...")
     val_loss_accum = 0.0
     val_steps = 0
-    for batched_x, batched_y in val_loader:
-        loss = compiled_eval_fn(params, batched_x, batched_y, precomputed_params)
+    
+    for batch in val_loader:
+        # Unpack x, y, (mask) and call with precomputed_params
+        loss = compiled_eval_fn(params, *batch[:2], precomputed_params, *batch[2:])
         val_loss_accum += loss
         val_steps += 1
     if val_steps == 0:
@@ -605,29 +718,6 @@ def train_loop(config: TrainConfig):
         jitted_eval_step = jit(eval_step, static_argnames=("model_config",))
 
         # AOT compile for the fixed batch shape
-        logger.msg("Starting Ahead-of-Time (AOT) compilation...")
-        activation_sharding = NamedSharding(mesh, P(*config.activation_sharding))
-        n_grad_acc = config.gradient_accumulation_steps
-        dummy_x = jnp.zeros((n_grad_acc, config.batch_size, config.block_size), dtype=jnp.int32)
-        dummy_y = jnp.zeros_like(dummy_x)
-        dummy_x = jax.device_put(dummy_x, activation_sharding)
-        dummy_y = jax.device_put(dummy_y, activation_sharding)
-
-        compiled_train_step = jitted_train_step.lower(
-            model_config,
-            params,
-            precomputed_params,
-            opt_state,
-            optimizer,
-            dummy_x,
-            dummy_y,
-        ).compile()
-
-        compiled_eval_step = jitted_eval_step.lower(
-            params, dummy_x, dummy_y, model_config, precomputed_params
-        ).compile()
-        logger.msg("AOT compilation finished.")
-
         # Load datasets
         logger.msg("Loading training data...")
         train_batches = load_dataset(config, logger, mesh, is_training=True)
@@ -638,12 +728,60 @@ def train_loop(config: TrainConfig):
         logger.msg("Loading validation data...")
         val_batches = load_dataset(val_config, logger, mesh, is_training=False)
         logger.msg(f"Loaded {len(val_batches)} validation batches.")
+        
+        has_mask = config.data_has_masks
+
+        # AOT compile training and evaluation functions
+        logger.msg("Starting Ahead-of-Time (AOT) compilation...")
+        activation_sharding = NamedSharding(mesh, P(*config.activation_sharding))
+        n_grad_acc = config.gradient_accumulation_steps
+        
+        seq_len = config.block_size
+        
+        dummy_x = jnp.zeros((n_grad_acc, config.batch_size, seq_len), dtype=jnp.int32)
+        dummy_y = jnp.zeros_like(dummy_x)
+        dummy_x = jax.device_put(dummy_x, activation_sharding)
+        dummy_y = jax.device_put(dummy_y, activation_sharding)
+        
+        if has_mask:
+            dummy_mask = jnp.ones((n_grad_acc, config.batch_size, seq_len), dtype=jnp.float32)
+            dummy_mask = jax.device_put(dummy_mask, activation_sharding)
+            
+            compiled_train_step = jitted_train_step.lower(
+                model_config,
+                params,
+                precomputed_params,
+                opt_state,
+                optimizer,
+                dummy_x,
+                dummy_y,
+                dummy_mask,
+            ).compile()
+
+            compiled_eval_step = jitted_eval_step.lower(
+                params, dummy_x, dummy_y, model_config, precomputed_params, dummy_mask
+            ).compile()
+        else:
+            compiled_train_step = jitted_train_step.lower(
+                model_config,
+                params,
+                precomputed_params,
+                opt_state,
+                optimizer,
+                dummy_x,
+                dummy_y,
+            ).compile()
+
+            compiled_eval_step = jitted_eval_step.lower(
+                params, dummy_x, dummy_y, model_config, precomputed_params
+            ).compile()
+        logger.msg("AOT compilation finished.")
 
         # Training loop
         logger.msg("Starting training...")
 
         for step in range(config.max_iters):
-            batched_x, batched_y = next(train_loader)
+            batch = next(train_loader)
 
             # First step we have logs from the initialization we want to keep
             if step > 0:
@@ -658,21 +796,18 @@ def train_loop(config: TrainConfig):
                     iter(val_batches),
                     logger,
                     compiled_eval_step,
+                    config,
                 )
                 log_dict["val_loss"] = val_loss
             
-            # Training
+            # Training: compiled_train_step(params, precomputed, opt_state, x, y, [mask])
             params, opt_state, metrics = compiled_train_step(
                 params,
                 precomputed_params,
                 opt_state,
-                batched_x,
-                batched_y,
+                *batch[:2],
+                *batch[2:],
             )
-
-            # # Normalize weights
-            # params["h"][0]["mlp"]["c_fc"] = params["h"][0]["mlp"]["c_fc"] / jnp.linalg.norm(params["h"][0]["mlp"]["c_fc"], axis=0, keepdims=True)
-            # params["h"][0]["mlp"]["c_proj"] = params["h"][0]["mlp"]["c_proj"] / jnp.linalg.norm(params["h"][0]["mlp"]["c_proj"], axis=-1, keepdims=True)
 
             # Logging at the end of every step
             if step % config.log_interval == 0:
@@ -698,6 +833,7 @@ def train_loop(config: TrainConfig):
             iter(val_batches),
             logger,
             compiled_eval_step,
+            config,
         )
         logger.log({"step": step, "val_loss": final_val_loss})
         logger.msg("Training finished.")

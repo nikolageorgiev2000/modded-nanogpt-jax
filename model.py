@@ -37,6 +37,7 @@ class GPTConfig:
     def n_head(self) -> int:
         return self.embd_dim // self.head_dim
 
+
 def precompute_rope(config: GPTConfig, mesh: Mesh = None) -> PyTree:
     if mesh is not None:
         weight_sharding = NamedSharding(mesh, P(config.weight_sharding))
@@ -306,14 +307,24 @@ def init_params(config: GPTConfig, mesh: Mesh, key: PRNGKey) -> tuple[PyTree, Py
 
 def loss_fn(
     params: PyTree,
-    batch: tuple[jax.Array, jax.Array],
+    batch: tuple[jax.Array, ...],
     config: GPTConfig,
     rope_params: PyTree,
     dropout_key: Optional[PRNGKey] = None,
     training: bool = False,
 ) -> jax.Array:
-    """Cross-entropy loss for language modeling."""
-    idx, targets = batch
+    """Cross-entropy loss for language modeling with optional mask.
+    
+    Args:
+        batch: Either (idx, targets) or (idx, targets, mask) where mask is a {0,1}
+               array indicating which positions to include in the loss.
+    """
+    if len(batch) == 3:
+        idx, targets, mask = batch
+    else:
+        idx, targets = batch
+        mask = None
+
     logits = gpt_forward(params, rope_params, idx, config, dropout_key, training)
 
     # Cross-entropy loss
@@ -322,7 +333,12 @@ def loss_fn(
         log_probs, jnp.expand_dims(targets, axis=-1), axis=-1
     ).squeeze(-1)
 
-    return -jnp.mean(target_log_probs)
+    if mask is not None:
+        # Masked loss: sum of masked losses / sum of active mask elements
+        masked_loss = -target_log_probs * mask
+        return jnp.sum(masked_loss) / jnp.sum(mask)
+    else:
+        return -jnp.mean(target_log_probs)
 
 
 def get_num_params(params: PyTree) -> int:
