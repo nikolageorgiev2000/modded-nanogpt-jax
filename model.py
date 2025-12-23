@@ -335,6 +335,8 @@ def loss_fn(
 
     if mask is not None:
         # Masked loss: sum of masked losses / sum of active mask elements
+        # assert same shape
+        assert target_log_probs.shape == mask.shape
         masked_loss = -target_log_probs * mask
         return jnp.sum(masked_loss) / jnp.sum(mask)
     else:

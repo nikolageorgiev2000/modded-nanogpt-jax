@@ -509,7 +509,8 @@ def load_dataset(
                     # Create x, y, and loss_mask with length = block_size
                     x = np.array(chunks[:-1], dtype=np.int32).reshape(num_samples, seq_len)
                     y = np.array(chunks[1:], dtype=np.int32).reshape(num_samples, seq_len)
-                    m = np.array(masks[1:], dtype=np.float32).reshape(num_samples, seq_len)
+                    # Normalize mask to {0, 1}: any non-zero value becomes 1
+                    m = (masks[1:] > 0).astype(np.float32).reshape(num_samples, seq_len)
                     
                     # If use_masked_loss=False, replace mask with ones to disable masking
                     if not config.use_masked_loss:
