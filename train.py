@@ -1,6 +1,33 @@
 """
 Training script for GPT in JAX - aligned with nanoGPT.
 Uses Optax AdamW optimizer with cosine learning rate schedule.
+
+Parameter Freezing:
+-------------------
+This script supports selective parameter freezing via the `freeze_params` config option.
+Frozen parameters will have their gradients zeroed out during training, effectively
+preventing them from being updated.
+
+To freeze parameters, specify string patterns in the `freeze_params` tuple. Any parameter
+whose path contains one of these patterns will be frozen.
+
+Examples:
+    # Freeze token embeddings
+    config = TrainConfig(freeze_params=("wte",))
+    
+    # Freeze first two transformer layers
+    config = TrainConfig(freeze_params=("h.0.", "h.1."))
+    
+    # Freeze all attention layers
+    config = TrainConfig(freeze_params=("attn",))
+    
+    # Freeze all layer norms
+    config = TrainConfig(freeze_params=("ln_",))
+    
+    # Freeze multiple components
+    config = TrainConfig(freeze_params=("wte", "h.0.", "h.1."))
+
+Parameter paths follow the structure: "wte", "h.0.attn.c_attn.weight", "h.1.mlp.c_fc.bias", etc.
 """
 
 import os
@@ -260,6 +287,10 @@ class TrainConfig:
     # Masked loss (dataset format: [chunk1][mask1][chunk2][mask2]...)
     use_masked_loss: bool = False
 
+    # Parameter freezing - specify parameter name patterns to freeze
+    # Examples: ("wte",) to freeze embeddings, ("h.0.", "h.1.") to freeze first two layers
+    freeze_params: tuple[str, ...] = ()
+
     @property
     def data_has_masks(self) -> bool:
         # needed to load data with the right shape (2, ntok)
@@ -303,6 +334,41 @@ def get_lr_schedule(config: TrainConfig) -> optax.Schedule:
         decay_steps=config.lr_decay_iters,
         end_value=config.min_lr,
     )
+
+
+def create_freeze_mask(params: PyTree, freeze_patterns: tuple[str, ...]) -> PyTree:
+    """
+    Create a boolean mask tree for frozen parameters.
+    
+    Args:
+        params: Parameter tree
+        freeze_patterns: Tuple of string patterns to match against parameter paths.
+                        If a parameter path contains any of these patterns, it will be frozen.
+    
+    Returns:
+        Boolean mask tree where True = update (train), False = freeze (no gradient)
+    
+    Example patterns:
+        ("wte",) - freeze token embeddings
+        ("h.0.", "h.1.") - freeze first two transformer layers
+        ("ln_",) - freeze all layer norms
+    """
+    if not freeze_patterns:
+        # No freezing - all parameters trainable
+        return tree_map(lambda _: True, params)
+    
+    def should_train(path, leaf):
+        # Convert path to string for pattern matching
+        # path is a tuple of keys like (('h', 0), ('attn',), ('c_attn',), ('weight',))
+        path_str = ".".join(str(key) for key_tuple in path for key in (key_tuple if isinstance(key_tuple, tuple) else (key_tuple,)))
+        
+        # Check if any freeze pattern matches
+        for pattern in freeze_patterns:
+            if pattern in path_str:
+                return False  # Freeze this parameter
+        return True  # Train this parameter
+    
+    return tree_map_with_path(should_train, params)
 
 
 def create_optimizer(config: TrainConfig) -> optax.GradientTransformation:
@@ -553,12 +619,15 @@ def train_step(
     batched_x: jax.Array,
     batched_y: jax.Array,
     batched_mask: Optional[jax.Array] = None,
+    freeze_mask: Optional[PyTree] = None,
 ) -> tuple[PyTree, PyTree, dict]:
     """Single training step with gradient accumulation.
     
     Args:
         batched_mask: Optional mask array of shape (n_grad_acc, batch_size, seq_len).
                       If provided, the loss will be computed only on masked positions.
+        freeze_mask: Optional boolean mask tree where True = trainable, False = frozen.
+                     Frozen parameters will have their gradients zeroed out.
     """
     n_grad_acc_steps = batched_x.shape[0]
 
@@ -588,6 +657,14 @@ def train_step(
     final_grads = tree_map(
         lambda g: (g / n_grad_acc_steps).astype(g.dtype), final_grads_accum
     )
+
+    # Apply freeze mask to gradients (zero out frozen parameters)
+    if freeze_mask is not None:
+        final_grads = tree_map(
+            lambda grad, mask: jnp.where(mask, grad, jnp.zeros_like(grad)),
+            final_grads,
+            freeze_mask,
+        )
 
     # Apply optimizer update
     updates, new_opt_state = optimizer.update(final_grads, opt_state, params)
@@ -657,8 +734,6 @@ def count_params(params: PyTree) -> dict[str, int]:
     
     # Token embeddings
     counts["embed"] = params["wte"].size
-    if "wpe" in params:
-        counts["embed"] += params["wpe"].size
     
     # Transformer blocks
     for block in params["h"]:
@@ -709,6 +784,25 @@ def train_loop(config: TrainConfig):
         
         # Get LR schedule for logging
         lr_schedule = get_lr_schedule(config)
+        
+        # Create freeze mask for parameter freezing
+        freeze_mask = create_freeze_mask(params, config.freeze_params)
+        if config.freeze_params:
+            # Count frozen parameters
+            frozen_count = 0
+            trainable_count = 0
+            def count_params_fn(path, leaf, mask_leaf):
+                nonlocal frozen_count, trainable_count
+                if mask_leaf:
+                    trainable_count += leaf.size
+                else:
+                    frozen_count += leaf.size
+            tree_map_with_path(count_params_fn, params, freeze_mask)
+            logger.msg(f"Parameter freezing enabled: {frozen_count:,} frozen, {trainable_count:,} trainable")
+            logger.msg(f"Freeze patterns: {config.freeze_params}")
+        else:
+            freeze_mask = None
+            logger.msg("No parameter freezing applied")
 
         # JIT compile training and evaluation functions
         jitted_train_step = jit(
@@ -757,6 +851,7 @@ def train_loop(config: TrainConfig):
                 dummy_x,
                 dummy_y,
                 dummy_mask,
+                freeze_mask,
             ).compile()
 
             compiled_eval_step = jitted_eval_step.lower(
@@ -771,6 +866,8 @@ def train_loop(config: TrainConfig):
                 optimizer,
                 dummy_x,
                 dummy_y,
+                None,  # batched_mask
+                freeze_mask,
             ).compile()
 
             compiled_eval_step = jitted_eval_step.lower(
@@ -801,13 +898,14 @@ def train_loop(config: TrainConfig):
                 )
                 log_dict["val_loss"] = val_loss
             
-            # Training: compiled_train_step(params, precomputed, opt_state, x, y, [mask])
+            # Training: compiled_train_step(params, precomputed, opt_state, x, y, [mask], freeze_mask)
             params, opt_state, metrics = compiled_train_step(
                 params,
                 precomputed_params,
                 opt_state,
                 *batch[:2],
                 *batch[2:],
+                freeze_mask,
             )
 
             # Logging at the end of every step
