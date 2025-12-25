@@ -275,7 +275,10 @@ class TrainConfig:
     block_size: int = 512  # sequence length
     vocab_size: int = 50304
     dropout: float = 0.0
+    max_seq_len: int = 2048  # maximum sequence length for RoPE precomputation
     rope_base: float = 10000.0  # RoPE base frequency
+    use_mlp: bool = True  # whether to use MLP layers in transformer blocks
+    off_by_one_attn: bool = False  # whether to add 1.0 to attention softmax denominator
 
     # Random seed
     seed: int = 1337
@@ -313,8 +316,11 @@ class TrainConfig:
             embd_dim=self.embd_dim,
             head_dim=self.head_dim,
             dropout=self.dropout,
+            max_seq_len=self.max_seq_len,
             rope_base=self.rope_base,
             weight_sharding=self.weight_sharding,
+            use_mlp=self.use_mlp,
+            off_by_one_attn=self.off_by_one_attn,
         )
 
 
@@ -742,11 +748,12 @@ def count_params(params: PyTree) -> dict[str, int]:
         counts["attn"] += sum(p.size for p in attn_params)
         
         # MLP
-        mlp_params = jax.tree_util.tree_leaves(block["mlp"])
-        counts["mlp"] += sum(p.size for p in mlp_params)
+        if "mlp" in block:
+            mlp_params = jax.tree_util.tree_leaves(block["mlp"])
+            counts["mlp"] += sum(p.size for p in mlp_params)
         
-        # LayerNorms in blocks
-        counts["total"] += block["ln_1"].size + block["ln_2"].size
+            # LayerNorms in blocks
+            counts["total"] += block["ln_1"].size + block["ln_2"].size
 
     counts["total"] += counts["attn"] + counts["mlp"] + counts["embed"] + params["ln_f"].size
     return counts

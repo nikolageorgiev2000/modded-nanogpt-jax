@@ -31,8 +31,12 @@ class GPTConfig:
     head_dim: int = 64
     dropout: float = 0.0  # dropout rate (0.0 = no dropout for pretraining)
     rope_base: float = 10000.0  # RoPE base frequency
-    weight_sharding: Optional[str] = None  # sharding spec for weights
+    max_seq_len: int = 2048  # maximum sequence length for RoPE precomputation
+    use_mlp: bool = True  # whether to use MLP layers in transformer blocks
+    off_by_one_attn: bool = False  # whether to add 1.0 to attention softmax denominator
 
+    weight_sharding: Optional[str] = None  # sharding spec for weights
+    
     @property
     def n_head(self) -> int:
         return self.embd_dim // self.head_dim
@@ -44,7 +48,7 @@ def precompute_rope(config: GPTConfig, mesh: Mesh = None) -> PyTree:
     else:
         weight_sharding = None
     dim = config.head_dim
-    seq_len = config.block_size
+    seq_len = config.max_seq_len
     inv_freq = 1.0 / (
         config.rope_base ** (jnp.arange(0, dim // 4, dtype=jnp.float32) / (dim // 4))
     )
@@ -78,6 +82,50 @@ def linear(x: jax.Array, weight: jax.Array) -> jax.Array:
     return x @ weight.astype(x.dtype)
 
 
+def dot_product_attention_off_by_one(
+    query: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    scale: float = 1.0,
+    is_causal: bool = False,
+) -> jax.Array:
+    """
+    Compute fixed 'off-by-one' scaled dot-product attention, i.e. a default score of 1.0 is added to the softmax denominator.
+    
+    Args:
+        query: (B, T, n_head, head_dim)
+        key: (B, T, n_head, head_dim)
+        value: (B, T, n_head, head_dim)
+        scale: Scaling factor for attention scores
+        is_causal: If True, apply causal mask
+    
+    Returns:
+        attention output: (B, T, n_head, head_dim)
+    """
+    # Compute attention scores: (B, n_head, T, T)
+    # einsum: (B, T_q, n_head, head_dim) @ (B, T_k, n_head, head_dim).T
+    scores = jnp.einsum("bqhd,bkhd->bhqk", query, key) * scale
+    
+    if is_causal:
+        # Create causal mask: lower triangular matrix
+        T = query.shape[1]
+        mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+        # Apply mask: set upper triangular to -inf
+        scores = jnp.where(mask, scores, -1e10)
+    
+    # Softmax over key dimension with logsumexp trick for numerical stability
+    max_score = jnp.max(scores, axis=-1, keepdims=True)
+    exp_scores = jnp.exp(scores - max_score)
+    # The added 1.0 needs to be scaled as exp(-max_score) to account for the max subtraction
+    attn_weights = exp_scores / (jnp.sum(exp_scores, axis=-1, keepdims=True) + jnp.exp(-max_score))
+    
+    # Apply attention to values: (B, n_head, T_q, T_k) @ (B, T_v, n_head, head_dim)
+    # -> (B, n_head, T_q, head_dim) -> (B, T_q, n_head, head_dim)
+    output = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, value)
+    
+    return output
+
+
 def causal_self_attention(
     x: jax.Array,
     c_attn_weight: jax.Array,
@@ -90,7 +138,7 @@ def causal_self_attention(
 ) -> jax.Array:
     """
     Causal self-attention with RoPE positional encoding.
-    Uses flash attention via jax.nn.dot_product_attention.
+    Uses either custom off-by-one attention or JAX's optimized dot_product_attention.
     """
     B, T, C = x.shape
     n_head = config.n_head
@@ -109,9 +157,14 @@ def causal_self_attention(
     q = apply_rotary_emb(q, cos[:T], sin[:T])
     k = apply_rotary_emb(k, cos[:T], sin[:T])
 
-    # Use JAX's efficient attention implementation
+    # Choose attention implementation based on config
     scale = config.embd_dim ** -0.5
-    y = jax.nn.dot_product_attention(q, k, v, scale=scale, is_causal=True)
+    if config.off_by_one_attn:
+        # Use custom attention with added 1.0 in denominator
+        y = dot_product_attention_off_by_one(q, k, v, scale=scale, is_causal=True)
+    else:
+        # Use JAX's optimized attention implementation
+        y = jax.nn.dot_product_attention(q, k, v, scale=scale, is_causal=True)
 
     # Reshape back: (B, T, n_head, head_dim) -> (B, T, C)
     y = y.reshape(B, T, C)
@@ -160,7 +213,7 @@ def block_forward(
     training: bool = False,
 ) -> jax.Array:
     """
-    Transformer block: x = x + attn(ln_1(x)); x = x + mlp(ln_2(x))
+    Transformer block: x = x + attn(ln_1(x)); x = x + mlp(ln_2(x)) (if use_mlp=True)
     """
     if training and dropout_key is not None:
         attn_key, mlp_key = jax.random.split(dropout_key)
@@ -181,18 +234,19 @@ def block_forward(
     )
     x = x + attn_out
 
-    # MLP with pre-norm
-    ln2_out = layer_norm(x, block_params["ln_2"])
-    mlp_out = mlp(
-        ln2_out,
-        block_params["mlp"]["c_fc"],
-        block_params["mlp"]["c_fc2"],
-        block_params["mlp"]["c_proj"],
-        config,
-        mlp_key,
-        training,
-    )
-    x = x + mlp_out
+    # MLP with pre-norm (only if use_mlp=True)
+    if config.use_mlp:
+        ln2_out = layer_norm(x, block_params["ln_2"])
+        mlp_out = mlp(
+            ln2_out,
+            block_params["mlp"]["c_fc"],
+            block_params["mlp"]["c_fc2"],
+            block_params["mlp"]["c_proj"],
+            config,
+            mlp_key,
+            training,
+        )
+        x = x + mlp_out
 
     return x
 
@@ -214,7 +268,7 @@ def gpt_forward(
     5. Language model head (weight-tied with token embeddings)
     """
     B, T = idx.shape
-    assert T <= config.block_size, f"Cannot forward sequence of length {T}, block size is only {config.block_size}"
+    assert T <= config.max_seq_len, f"Cannot forward sequence of length {T}, max sequence length is only {config.max_seq_len}"
 
     # Token embeddings (no position embeddings - using RoPE)
     x = params["wte"][idx]
@@ -283,17 +337,21 @@ def init_params(config: GPTConfig, mesh: Mesh, key: PRNGKey) -> tuple[PyTree, Py
     for _ in range(config.n_layer):
         block_params = {
             "ln_1": sharded_ones((config.embd_dim,)),
-            "ln_2": sharded_ones((config.embd_dim,)),
             "attn": {
                 "c_attn": sharded_normal(next(keys), (config.embd_dim, 3 * config.embd_dim)),
                 "c_proj": sharded_normal(next(keys), (config.embd_dim, config.embd_dim), std=residual_scale),
             },
-            "mlp": {
+        }
+        
+        # Only initialize MLP parameters if use_mlp=True
+        if config.use_mlp:
+            block_params["ln_2"] = sharded_ones((config.embd_dim,))
+            block_params["mlp"] = {
                 "c_fc": sharded_normal(next(keys), (config.embd_dim, int(8/3.0 * config.embd_dim))),
                 "c_fc2": sharded_normal(next(keys), (config.embd_dim, int(8/3.0 * config.embd_dim))),
                 "c_proj": sharded_normal(next(keys), (int(8/3.0 * config.embd_dim), config.embd_dim), std=residual_scale),
-            },
-        }
+            }
+        
         params["h"].append(block_params)
 
     # Final layer norm
