@@ -306,6 +306,7 @@ class TrainConfig:
                 f"use_masked_loss=True requires data with masks (filenames containing 'mask'), "
                 f"but input paths are '{self.input_bin}' and '{self.input_val_bin}'"
             )
+        assert self.max_seq_len >= self.block_size, f"max_seq_len must be greater than or equal to block_size, got {self.max_seq_len} and {self.block_size}"
 
     def get_model_config(self) -> GPTConfig:
         """Create GPTConfig from training config."""
