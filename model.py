@@ -300,6 +300,44 @@ def gpt_forward(
     return logits.astype(jnp.float32)
 
 
+def newtonschulz5(G: jax.Array, steps: int = 5, eps: float = 1e-7) -> jax.Array:
+    """
+    JAX implementation of Newton-Schulz iteration for matrix function.
+    Source: https://kellerjordan.github.io/posts/muon/
+    Args:
+        G: [n, m] matrix
+        steps: number of Newton-Schulz steps
+        eps: small numerical constant
+    Returns:
+        [n, m] or [m, n] matrix depending on input shape
+    """
+    assert G.ndim == 2
+    a, b, c = 2.0, -1.5, 0.5
+
+    # Ensure bfloat16 dtype
+    X = G.astype(jnp.bfloat16)
+
+    # Normalize
+    X = X / (jnp.linalg.norm(X) + eps)
+
+    swapped = X.shape[0] > X.shape[1]
+    if swapped:
+        X = jnp.transpose(X)
+
+    def body_fun(_, X):
+        A = X @ X.T
+        B = b * A + c * (A @ A)
+        X_new = a * X + B @ X
+        return X_new
+
+    X = jax.lax.fori_loop(0, steps, body_fun, X)
+
+    if swapped:
+        X = jnp.transpose(X)
+
+    return X
+
+
 def init_params(config: GPTConfig, mesh: Mesh, key: PRNGKey) -> tuple[PyTree, PyTree]:
     """
     Initialize GPT parameters following nanoGPT initialization:
@@ -329,6 +367,7 @@ def init_params(config: GPTConfig, mesh: Mesh, key: PRNGKey) -> tuple[PyTree, Py
 
     # Token embeddings: (vocab_size, embd_dim)
     params["wte"] = sharded_normal(next(keys), (config.vocab_size, config.embd_dim))
+    # params["wte"] = newtonschulz5(params["wte"])
 
     # Transformer blocks
     params["h"] = []
