@@ -276,9 +276,10 @@ class TrainConfig:
     vocab_size: int = 50304
     dropout: float = 0.0
     max_seq_len: int = 2048  # maximum sequence length for RoPE precomputation
-    rope_base: float = 10000.0  # RoPE base frequency
+    pos_encoding_base: float = 10000.0  # RoPE base frequency
     use_mlp: bool = True  # whether to use MLP layers in transformer blocks
     off_by_one_attn: bool = False  # whether to add 1.0 to attention softmax denominator
+    use_pope: bool = False  # whether to use PoPE
 
     # Random seed
     seed: int = 1337
@@ -318,10 +319,11 @@ class TrainConfig:
             head_dim=self.head_dim,
             dropout=self.dropout,
             max_seq_len=self.max_seq_len,
-            rope_base=self.rope_base,
-            weight_sharding=self.weight_sharding,
-            use_mlp=self.use_mlp,
+            pos_encoding_base=self.pos_encoding_base,
             off_by_one_attn=self.off_by_one_attn,
+            use_mlp=self.use_mlp,
+            use_pope=self.use_pope,
+            weight_sharding=self.weight_sharding,
         )
 
 

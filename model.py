@@ -30,8 +30,9 @@ class GPTConfig:
     embd_dim: int = 768
     head_dim: int = 64
     dropout: float = 0.0  # dropout rate (0.0 = no dropout for pretraining)
-    rope_base: float = 10000.0  # RoPE base frequency
-    max_seq_len: int = 2048  # maximum sequence length for RoPE precomputation
+    pos_encoding_base: float = 10000.0  # positional embeddings base frequency
+    max_seq_len: int = 2048  # maximum sequence length for positional embeddings precomputation
+    use_pope: bool = False  # if True, use PoPE; otherwise default to RoPE
     use_mlp: bool = True  # whether to use MLP layers in transformer blocks
     off_by_one_attn: bool = False  # whether to add 1.0 to attention softmax denominator
 
@@ -50,13 +51,47 @@ def precompute_rope(config: GPTConfig, mesh: Mesh = None) -> PyTree:
     dim = config.head_dim
     seq_len = config.max_seq_len
     inv_freq = 1.0 / (
-        config.rope_base ** (jnp.arange(0, dim // 4, dtype=jnp.float32) / (dim // 4))
+        config.pos_encoding_base ** (jnp.arange(0, dim // 4, dtype=jnp.float32) / (dim // 4))
     )
     inv_freq = jnp.concatenate([inv_freq, jnp.zeros_like(inv_freq)])
     t = jnp.arange(seq_len)
     freqs = jnp.outer(t, inv_freq)
     cos = jnp.cos(freqs).astype(jnp.bfloat16)
     sin = jnp.sin(freqs).astype(jnp.bfloat16)
+    precomputed_params = {}
+    precomputed_params["cos"] = jax.device_put(cos[:, None, :], weight_sharding)
+    precomputed_params["sin"] = jax.device_put(sin[:, None, :], weight_sharding)
+    return precomputed_params
+
+def precompute_pope(config: GPTConfig, mesh: Mesh = None) -> PyTree:
+    """
+    Precompute PoPE position tables.
+
+    We implement PoPE scores with:
+      a_{t,s} = sum_c softplus(q_{t,c}) * softplus(k_{s,c}) * cos((s - t) * theta_c)
+    (delta term ignored / assumed 0).
+
+    Using the identity:
+      cos((s-t)θ) = cos(sθ)cos(tθ) + sin(sθ)sin(tθ)
+    we only need per-position cos/sin tables (T x head_dim), not a (T x T x head_dim) tensor.
+    """
+    if mesh is not None:
+        weight_sharding = NamedSharding(mesh, P(config.weight_sharding))
+    else:
+        weight_sharding = None
+
+    dim = config.head_dim
+    seq_len = config.max_seq_len
+
+    # PoPE uses one frequency per scalar feature (d frequencies instead of d/2).
+    # This matches "doubling the number of frequencies" relative to standard RoPE.
+    inv_freq = 1.0 / (config.pos_encoding_base ** (jnp.arange(0, dim, dtype=jnp.float32) / dim))
+    t = jnp.arange(seq_len, dtype=jnp.float32)
+    freqs = jnp.outer(t, inv_freq)
+
+    cos = jnp.cos(freqs).astype(jnp.bfloat16)
+    sin = jnp.sin(freqs).astype(jnp.bfloat16)
+
     precomputed_params = {}
     precomputed_params["cos"] = jax.device_put(cos[:, None, :], weight_sharding)
     precomputed_params["sin"] = jax.device_put(sin[:, None, :], weight_sharding)
@@ -82,47 +117,63 @@ def linear(x: jax.Array, weight: jax.Array) -> jax.Array:
     return x @ weight.astype(x.dtype)
 
 
-def dot_product_attention_off_by_one(
+def dot_product_attention_custom(
     query: jax.Array,
     key: jax.Array,
     value: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
+    config: GPTConfig,
     scale: float = 1.0,
     is_causal: bool = False,
 ) -> jax.Array:
     """
-    Compute fixed 'off-by-one' scaled dot-product attention, i.e. a default score of 1.0 is added to the softmax denominator.
-    
-    Args:
-        query: (B, T, n_head, head_dim)
-        key: (B, T, n_head, head_dim)
-        value: (B, T, n_head, head_dim)
-        scale: Scaling factor for attention scores
-        is_causal: If True, apply causal mask
-    
-    Returns:
-        attention output: (B, T, n_head, head_dim)
+    Custom attention supporting:
+    - RoPE (default) vs PoPE (config.use_pope)
+    - Standard softmax vs off-by-one denominator tweak (config.off_by_one_attn)
+
+    PoPE implements (delta ignored):
+      scores[t,s] = sum_c softplus(q[t,c]) * softplus(k[s,c]) * cos((s-t)*theta_c)
+
+    Using:
+      cos((s-t)θ) = cos(sθ)cos(tθ) + sin(sθ)sin(tθ)
+    we compute PoPE logits via two matmuls without materializing a (T x T x d) tensor.
     """
-    # Compute attention scores: (B, n_head, T, T)
-    # einsum: (B, T_q, n_head, head_dim) @ (B, T_k, n_head, head_dim).T
-    scores = jnp.einsum("bqhd,bkhd->bhqk", query, key) * scale
-    
+    T = query.shape[1]
+    if config.use_pope:
+        cos_t = cos[:T]  # (T, 1, head_dim)
+        sin_t = sin[:T]  # (T, 1, head_dim)
+
+        qmag = jax.nn.softplus(query)
+        kmag = jax.nn.softplus(key)
+
+        q_cos = qmag * cos_t
+        q_sin = qmag * sin_t
+        k_cos = kmag * cos_t
+        k_sin = kmag * sin_t
+
+        scores = (
+            jnp.einsum("bqhd,bkhd->bhqk", q_cos, k_cos)
+            + jnp.einsum("bqhd,bkhd->bhqk", q_sin, k_sin)
+        ) * scale
+    else:
+        # RoPE path: rotate Q/K, then standard dot-product logits
+        q = apply_rotary_emb(query, cos[:T], sin[:T])
+        k = apply_rotary_emb(key, cos[:T], sin[:T])
+        scores = jnp.einsum("bqhd,bkhd->bhqk", q, k) * scale
+
     if is_causal:
-        # Create causal mask: lower triangular matrix
-        T = query.shape[1]
         mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-        # Apply mask: set upper triangular to -inf
         scores = jnp.where(mask, scores, -1e10)
-    
-    # Softmax over key dimension with logsumexp trick for numerical stability
-    max_score = jnp.max(scores, axis=-1, keepdims=True)
-    exp_scores = jnp.exp(scores - max_score)
-    # The added 1.0 needs to be scaled as exp(-max_score) to account for the max subtraction
-    attn_weights = exp_scores / (jnp.sum(exp_scores, axis=-1, keepdims=True) + jnp.exp(-max_score))
-    
-    # Apply attention to values: (B, n_head, T_q, T_k) @ (B, T_v, n_head, head_dim)
-    # -> (B, n_head, T_q, head_dim) -> (B, T_q, n_head, head_dim)
+
+    if config.off_by_one_attn:
+        max_score = jnp.max(scores, axis=-1, keepdims=True)
+        exp_scores = jnp.exp(scores - max_score)
+        # The added 1.0 needs to be scaled as exp(-max_score) to account for the max subtraction
+        attn_weights = exp_scores / (jnp.sum(exp_scores, axis=-1, keepdims=True) + jnp.exp(-max_score))
+    else:
+        attn_weights = softmax(scores, axis=-1)
     output = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, value)
-    
     return output
 
 
@@ -137,7 +188,7 @@ def causal_self_attention(
     training: bool = False,
 ) -> jax.Array:
     """
-    Causal self-attention with RoPE positional encoding.
+    Causal self-attention with positional embeddings.
     Uses either custom off-by-one attention or JAX's optimized dot_product_attention.
     """
     B, T, C = x.shape
@@ -153,18 +204,9 @@ def causal_self_attention(
     k = k.reshape(B, T, n_head, head_dim)
     v = v.reshape(B, T, n_head, head_dim)
 
-    # Apply RoPE to Q and K
-    q = apply_rotary_emb(q, cos[:T], sin[:T])
-    k = apply_rotary_emb(k, cos[:T], sin[:T])
-
-    # Choose attention implementation based on config
+    # Choose attention implementation based on config and positional embeddings
     scale = config.embd_dim ** -0.5
-    if config.off_by_one_attn:
-        # Use custom attention with added 1.0 in denominator
-        y = dot_product_attention_off_by_one(q, k, v, scale=scale, is_causal=True)
-    else:
-        # Use JAX's optimized attention implementation
-        y = jax.nn.dot_product_attention(q, k, v, scale=scale, is_causal=True)
+    y = dot_product_attention_custom(q, k, v, cos=cos, sin=sin, config=config, scale=scale, is_causal=True)
 
     # Reshape back: (B, T, n_head, head_dim) -> (B, T, C)
     y = y.reshape(B, T, C)
@@ -253,7 +295,7 @@ def block_forward(
 
 def gpt_forward(
     params: PyTree,
-    rope_params: PyTree,
+    pos_params: PyTree,
     idx: jax.Array,
     config: GPTConfig,
     dropout_key: Optional[PRNGKey] = None,
@@ -261,7 +303,7 @@ def gpt_forward(
 ) -> jax.Array:
     """
     GPT forward pass:
-    1. Token embeddings (RoPE applied in attention)
+    1. Token embeddings (positional embeddings applied in attention)
     2. Dropout
     3. N transformer blocks
     4. Final layer norm
@@ -270,7 +312,7 @@ def gpt_forward(
     B, T = idx.shape
     assert T <= config.max_seq_len, f"Cannot forward sequence of length {T}, max sequence length is only {config.max_seq_len}"
 
-    # Token embeddings (no position embeddings - using RoPE)
+    # Token embeddings (no position embeddings - using positional embeddings)
     x = params["wte"][idx]
 
     # Dropout on embeddings
@@ -279,9 +321,9 @@ def gpt_forward(
         mask = jax.random.bernoulli(drop_key, 1 - config.dropout, x.shape)
         x = jnp.where(mask, x / (1 - config.dropout), 0)
 
-    # Get RoPE cos/sin
-    cos = rope_params["cos"]
-    sin = rope_params["sin"]
+    # Get positional embeddings cos/sin
+    cos = pos_params["cos"]
+    sin = pos_params["sin"]
 
     # Transformer blocks
     for block_params in params["h"]:
@@ -348,7 +390,7 @@ def init_params(config: GPTConfig, mesh: Mesh, key: PRNGKey) -> tuple[PyTree, Py
     
     Returns:
         params: Learnable model parameters
-        rope_params: Precomputed RoPE cos/sin embeddings (not learned)
+        pos_params: Precomputed positional embeddings cos/sin embeddings (not learned)
     """
     weight_sharding = NamedSharding(mesh, P(config.weight_sharding))
     dtype = jnp.bfloat16
@@ -396,17 +438,17 @@ def init_params(config: GPTConfig, mesh: Mesh, key: PRNGKey) -> tuple[PyTree, Py
     # Final layer norm
     params["ln_f"] = sharded_ones((config.embd_dim,))
 
-    # Precompute RoPE embeddings
-    rope_params = precompute_rope(config, mesh)
+    # Precompute positional embeddings/tables (not learned)
+    pos_params = precompute_pope(config, mesh) if config.use_pope else precompute_rope(config, mesh)
 
-    return params, rope_params
+    return params, pos_params
 
 
 def loss_fn(
     params: PyTree,
     batch: tuple[jax.Array, ...],
     config: GPTConfig,
-    rope_params: PyTree,
+    pos_params: PyTree,
     dropout_key: Optional[PRNGKey] = None,
     training: bool = False,
 ) -> jax.Array:
@@ -422,7 +464,7 @@ def loss_fn(
         idx, targets = batch
         mask = None
 
-    logits = gpt_forward(params, rope_params, idx, config, dropout_key, training)
+    logits = gpt_forward(params, pos_params, idx, config, dropout_key, training)
 
     # Cross-entropy loss
     log_probs = jax.nn.log_softmax(logits, axis=-1)
@@ -444,6 +486,6 @@ def get_num_params(params: PyTree) -> int:
     """
     Return the number of parameters in the model.
     Token embeddings are counted because they are weight-tied with lm_head.
-    RoPE parameters are precomputed and not learned, so not included.
+    Positional embeddings are precomputed and not learned, so not included.
     """
     return sum(p.size for p in jax.tree_util.tree_leaves(params))
