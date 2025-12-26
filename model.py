@@ -126,7 +126,8 @@ def dot_product_attention_custom(
     config: GPTConfig,
     scale: float = 1.0,
     is_causal: bool = False,
-) -> jax.Array:
+    return_attn_weights: bool = False,
+) -> tuple[jax.Array, Optional[jax.Array]]:
     """
     Custom attention supporting:
     - RoPE (default) vs PoPE (config.use_pope)
@@ -174,7 +175,7 @@ def dot_product_attention_custom(
     else:
         attn_weights = softmax(scores, axis=-1)
     output = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, value)
-    return output
+    return output, attn_weights if return_attn_weights else None
 
 
 def causal_self_attention(
@@ -186,6 +187,7 @@ def causal_self_attention(
     config: GPTConfig,
     dropout_key: Optional[PRNGKey] = None,
     training: bool = False,
+    return_attn_weights: bool = False,
 ) -> jax.Array:
     """
     Causal self-attention with positional embeddings.
@@ -206,7 +208,7 @@ def causal_self_attention(
 
     # Choose attention implementation based on config and positional embeddings
     scale = config.embd_dim ** -0.5
-    y = dot_product_attention_custom(q, k, v, cos=cos, sin=sin, config=config, scale=scale, is_causal=True)
+    y, attn_weights = dot_product_attention_custom(q, k, v, cos=cos, sin=sin, config=config, scale=scale, is_causal=True, return_attn_weights=return_attn_weights)
 
     # Reshape back: (B, T, n_head, head_dim) -> (B, T, C)
     y = y.reshape(B, T, C)
@@ -219,7 +221,7 @@ def causal_self_attention(
         mask = jax.random.bernoulli(dropout_key, 1 - config.dropout, y.shape)
         y = jnp.where(mask, y / (1 - config.dropout), 0)
 
-    return y
+    return y, attn_weights
 
 
 def mlp(
@@ -253,7 +255,8 @@ def block_forward(
     config: GPTConfig,
     dropout_key: Optional[PRNGKey] = None,
     training: bool = False,
-) -> jax.Array:
+    return_attn_weights: bool = False,
+) -> tuple[jax.Array, Optional[jax.Array]]:
     """
     Transformer block: x = x + attn(ln_1(x)); x = x + mlp(ln_2(x)) (if use_mlp=True)
     """
@@ -264,7 +267,7 @@ def block_forward(
 
     # Attention with pre-norm
     ln1_out = layer_norm(x, block_params["ln_1"])
-    attn_out = causal_self_attention(
+    attn_out, attn_weights = causal_self_attention(
         ln1_out,
         block_params["attn"]["c_attn"],
         block_params["attn"]["c_proj"],
@@ -273,6 +276,7 @@ def block_forward(
         config,
         attn_key,
         training,
+        return_attn_weights=return_attn_weights,
     )
     x = x + attn_out
 
@@ -290,7 +294,7 @@ def block_forward(
         )
         x = x + mlp_out
 
-    return x
+    return x, attn_weights if return_attn_weights else None
 
 
 def gpt_forward(
@@ -300,7 +304,8 @@ def gpt_forward(
     config: GPTConfig,
     dropout_key: Optional[PRNGKey] = None,
     training: bool = False,
-) -> jax.Array:
+    return_attn_weights: bool = False,
+) -> tuple[jax.Array, Optional[jax.Array]]:
     """
     GPT forward pass:
     1. Token embeddings (positional embeddings applied in attention)
@@ -326,12 +331,15 @@ def gpt_forward(
     sin = pos_params["sin"]
 
     # Transformer blocks
+    attn_weights_list = []
     for block_params in params["h"]:
         if training and dropout_key is not None:
             dropout_key, block_key = jax.random.split(dropout_key)
         else:
             block_key = None
-        x = block_forward(x, block_params, cos, sin, config, block_key, training)
+        x, attn_weights = block_forward(x, block_params, cos, sin, config, block_key, training, return_attn_weights=return_attn_weights)
+        if return_attn_weights:
+            attn_weights_list.append(attn_weights)
 
     # Final layer norm
     x = layer_norm(x, params["ln_f"])
@@ -339,7 +347,10 @@ def gpt_forward(
     # Language model head (weight-tied with wte): logits = x @ wte.T
     logits = jnp.einsum("...d,vd->...v", x, params["wte"].astype(x.dtype))
 
-    return logits.astype(jnp.float32)
+    if return_attn_weights:
+        return logits.astype(jnp.float32), attn_weights_list
+    else:
+        return logits.astype(jnp.float32)
 
 
 def newtonschulz5(G: jax.Array, steps: int = 5, eps: float = 1e-7) -> jax.Array:
