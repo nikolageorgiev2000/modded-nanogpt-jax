@@ -8,3 +8,5 @@ ipynb
 jupyter
 notebook
 matplotlib
+numba
+autopep8
