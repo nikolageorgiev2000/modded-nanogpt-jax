@@ -28,6 +28,21 @@ Examples:
     config = TrainConfig(freeze_params=("wte", "h.0.", "h.1."))
 
 Parameter paths follow the structure: "wte", "h.0.attn.c_attn.weight", "h.1.mlp.c_fc.bias", etc.
+
+Custom targets:
+---------------
+This script optionally supports supervised / non-autoregressive targets stored in the dataset.
+When enabled via `TrainConfig.use_custom_target=True`, the loader will read `y` directly from the
+dataset instead of constructing it via a 1-token shift (autoregressive next-token prediction).
+
+Dataset layout (uint16 `.bin`, no header):
+  - default (no masks, no custom targets): shape (N,) tokens
+  - masked loss (masks only): shape (2, N) where row0=tokens, row1=masks
+  - custom targets without masks: shape (2, N) where row0=tokens, row1=targets
+  - custom targets with masks: shape (3, N) where row0=tokens, row1=targets, row2=masks
+
+Note: for `use_custom_target=True`, the loader reads exactly `tokens_per_batch` elements (no +1),
+and expects targets/masks to align position-wise with `x` (same length).
 """
 
 import os
@@ -221,6 +236,15 @@ def is_masked(config: Any) -> bool:
         and "mask" in config.input_val_bin.lower()
     )
 
+def is_targeted(config: Any) -> bool:
+    """Check if a config indicates a dataset with targets (both train and val contain 'target')."""
+    return (
+        hasattr(config, "input_bin")
+        and "target" in config.input_bin.lower()
+        and hasattr(config, "input_val_bin")
+        and "target" in config.input_val_bin.lower()
+    )
+
 
 @dataclass(kw_only=True, frozen=True)
 @jax.tree_util.register_static
@@ -291,6 +315,10 @@ class TrainConfig:
     # Masked loss (dataset format: [chunk1][mask1][chunk2][mask2]...)
     use_masked_loss: bool = False
 
+    # Custom targets: read `y` directly from the dataset instead of autoregressive shifting.
+    # Note: datasets may contain targets even if this is False; those targets will be ignored.
+    use_custom_target: bool = False
+
     # Parameter freezing - specify parameter name patterns to freeze
     # Examples: ("wte",) to freeze embeddings, ("h.0.", "h.1.") to freeze first two layers
     freeze_params: tuple[str, ...] = ()
@@ -300,11 +328,21 @@ class TrainConfig:
         # needed to load data with the right shape (2, ntok)
         return is_masked(self)
 
+    @property
+    def data_has_targets(self) -> bool:
+        # needed to load data with the right shape (2 or 3, ntok)
+        return is_targeted(self)
+
     def __post_init__(self):
         object.__setattr__(self, "mesh_shape", (jax.device_count(),))
         if self.use_masked_loss:
             assert self.data_has_masks, (
                 f"use_masked_loss=True requires data with masks (filenames containing 'mask'), "
+                f"but input paths are '{self.input_bin}' and '{self.input_val_bin}'"
+            )
+        if self.use_custom_target:
+            assert self.data_has_targets, (
+                f"use_custom_target=True requires data with targets (filenames containing 'target'), "
                 f"but input paths are '{self.input_bin}' and '{self.input_val_bin}'"
             )
         assert self.max_seq_len >= self.block_size, f"max_seq_len must be greater than or equal to block_size, got {self.max_seq_len} and {self.block_size}"
@@ -423,11 +461,17 @@ def load_dataset(
     """Load dataset from binary files.
     
     Returns:
-        loader: Iterable yielding batches as either (x, y) or (x, y, mask) depending on 
-                whether the data has masks.
+        loader: Iterable yielding batches as either (x, y) or (x, y, mask).
+                - If `config.use_masked_loss=True`, yields (x, y, mask)
+                - Else yields (x, y)
+                - If `config.use_custom_target=True`, `y` is read from the dataset; otherwise
+                  `y` is built autoregressively as a 1-token shift of `x`.
     
-    Data is detected as having masks if the config indicates it (config.data_has_masks).
-    For masked data, the format is 2D array (2, ntok) where row 0 is tokens, row 1 is masks.
+    Dataset capabilities are inferred from filenames:
+      - masks present if `config.data_has_masks` (filenames contain 'mask')
+      - targets present if `config.data_has_targets` (filenames contain 'target')
+
+    Row order when both are present: [tokens, targets, masks].
     """
     process_rank = jax.process_index()
     num_processes = jax.process_count()
@@ -437,8 +481,15 @@ def load_dataset(
     if not files:
         raise RuntimeError(f"No files found for pattern {input_pattern}")
     
-    # Detect if data has masks
-    has_mask = config.data_has_masks
+    # Detect dataset contents (by convention: filenames contain 'mask' and/or 'target')
+    data_has_masks = config.data_has_masks
+    data_has_targets = config.data_has_targets
+
+    # Whether training will *use* these fields
+    use_masked_loss = bool(getattr(config, "use_masked_loss", False))
+    use_custom_target = bool(getattr(config, "use_custom_target", False))
+
+    n_rows = 1 + (1 if data_has_targets else 0) + (1 if data_has_masks else 0)
 
     def _describe_token_file(filename: str) -> dict[str, Any]:
         """Assumes `.bin`: raw uint16 tokens (no header)."""
@@ -451,13 +502,12 @@ def load_dataset(
             )
         total_elements = filesize // 2
         
-        if has_mask:
-            # 2D array: (2, ntok) where row 0 is tokens, row 1 is masks
-            assert total_elements % 2 == 0, (
-                f"Masked data file {filename} must have even number of uint16 elements "
-                f"to form (2, N) array, got {total_elements}"
+        if n_rows > 1:
+            assert total_elements % n_rows == 0, (
+                f"Expected {n_rows} rows in data file {filename} but number of uint16 elements "
+                f"({total_elements}) is not divisible by {n_rows}."
             )
-            ntok = total_elements // 2
+            ntok = total_elements // n_rows
         else:
             ntok = total_elements
         
@@ -472,13 +522,13 @@ def load_dataset(
         kind = file_info["kind"]
         if kind == "bin_raw":
             ntok = int(file_info["ntok"])
-            if has_mask:
-                # 2D array: (2, ntok) - row 0 is tokens, row 1 is masks
+            if n_rows > 1:
+                # Multi-row array: see header comment for row semantics.
                 return np.memmap(
                     filename,
                     dtype=np.uint16,
                     mode="r",
-                    shape=(2, ntok),
+                    shape=(n_rows, ntok),
                 )
             else:
                 return np.memmap(
@@ -503,7 +553,7 @@ def load_dataset(
     def _read_token_window(start: int, end: int) -> np.ndarray:
         """Read tokens in [start, end) from the virtual concatenation of shards.
         
-        For masked data (2D): returns shape (2, end - start)
+        For multi-row data: returns shape (n_rows, end - start)
         For non-masked data (1D): returns shape (end - start,)
         """
         if start < 0 or end < 0 or end < start:
@@ -513,8 +563,8 @@ def load_dataset(
                 f"Token window out of range: end={end} > total_ntok={total_ntok}"
             )
         if start == end:
-            if has_mask:
-                return np.empty((2, 0), dtype=np.uint16)
+            if n_rows > 1:
+                return np.empty((n_rows, 0), dtype=np.uint16)
             else:
                 return np.empty((0,), dtype=np.uint16)
 
@@ -526,8 +576,8 @@ def load_dataset(
             local_start = pos - shard_start
             local_end = min(int(shard_lengths[shard_idx]), local_start + (end - pos))
             mm = _open_tokens_memmap(file_infos[shard_idx])
-            if has_mask:
-                # mm shape: (2, shard_ntok), slice along token dimension
+            if n_rows > 1:
+                # mm shape: (n_rows, shard_ntok), slice along token dimension
                 parts.append(mm[:, local_start:local_end])
             else:
                 parts.append(mm[local_start:local_end])
@@ -535,7 +585,7 @@ def load_dataset(
         if len(parts) == 1:
             return parts[0]
         # Concatenate along token dimension (axis 1 for 2D, axis 0 for 1D)
-        return np.concatenate(parts, axis=1 if has_mask else 0)
+        return np.concatenate(parts, axis=1 if n_rows > 1 else 0)
 
     batch_size = config.batch_size
     n_grad_acc = config.gradient_accumulation_steps
@@ -548,7 +598,9 @@ def load_dataset(
 
     activation_sharding = NamedSharding(mesh, P(*config.activation_sharding))
     
-    # We read tokens_per_batch + 1 to create shifted x/y (targets)
+    # For autoregressive targets we read tokens_per_batch + 1 to create shifted x/y (targets).
+    # For custom targets we read exactly tokens_per_batch and expect y (and optional masks)
+    # to align position-wise with x.
     seq_len = config.block_size
     tokens_per_batch = num_samples * seq_len
 
@@ -560,15 +612,18 @@ def load_dataset(
             cursor = 0
             for _ in range(num_batches):
                 start_idx = cursor
-                # Need +1 token for the shifted target
-                end_idx = start_idx + tokens_per_batch + 1
+                if use_custom_target:
+                    end_idx = start_idx + tokens_per_batch
+                else:
+                    # Need +1 token for the shifted target
+                    end_idx = start_idx + tokens_per_batch + 1
 
                 if end_idx > total_ntok:
                     if process_rank == 0:
                         logger.msg("Cycling dataset...")
                     cursor = 0
                     start_idx = 0
-                    end_idx = tokens_per_batch + 1
+                    end_idx = tokens_per_batch if use_custom_target else (tokens_per_batch + 1)
                     if end_idx > total_ntok:
                         raise RuntimeError(
                             f"Not enough tokens ({total_ntok}) to form even one batch of size {end_idx}."
@@ -576,34 +631,61 @@ def load_dataset(
 
                 buf = _read_token_window(start_idx, end_idx)
 
-                if has_mask:
-                    # buf shape: (2, tokens_per_batch + 1)
+                if n_rows > 1:
+                    # Multi-row layouts:
+                    # - masks only: (2, N) => [tokens, masks]
+                    # - targets only: (2, N) => [tokens, targets]
+                    # - targets + masks: (3, N) => [tokens, targets, masks]
                     chunks = buf[0]  # tokens
-                    masks = buf[1]   # masks
-                    
-                    # Create x, y, and loss_mask with length = block_size
-                    x = np.array(chunks[:-1], dtype=np.int32).reshape(num_samples, seq_len)
-                    y = np.array(chunks[1:], dtype=np.int32).reshape(num_samples, seq_len)
-                    # Normalize mask to {0, 1}: any non-zero value becomes 1
-                    m = (masks[1:] > 0).astype(np.float32).reshape(num_samples, seq_len)
-                    
-                    # If use_masked_loss=False, replace mask with ones to disable masking
-                    if not config.use_masked_loss:
-                        m = np.ones_like(m)
+                    if data_has_targets:
+                        targets = buf[1]
+                    if data_has_masks:
+                        masks = buf[2] if data_has_targets else buf[1]
+
+                    if use_custom_target:
+                        # Create x, y (and optional loss_mask) with length = block_size
+                        x = np.array(chunks, dtype=np.int32).reshape(num_samples, seq_len)
+                        y = np.array(targets, dtype=np.int32).reshape(num_samples, seq_len)
+                        if data_has_masks:
+                            # Normalize mask to {0, 1}: any non-zero value becomes 1
+                            m = (masks > 0).astype(np.float32).reshape(num_samples, seq_len)
+                    else:
+                        # Autoregressive targets from shifted tokens
+                        x = np.array(chunks[:-1], dtype=np.int32).reshape(num_samples, seq_len)
+                        y = np.array(chunks[1:], dtype=np.int32).reshape(num_samples, seq_len)
+                        # Normalize mask to {0, 1}: any non-zero value becomes 1
+                        m = (masks[1:] > 0).astype(np.float32).reshape(num_samples, seq_len)
+
+                    # If use_masked_loss=False or no masks available, disable masking by using ones.
+                    if data_has_masks and not use_masked_loss:
+                            m = np.ones_like(m)
 
                     # Reshape and shard
-                    batched_x = jax.device_put(einops.rearrange(x, "(a b) s -> a b s", a=n_grad_acc), activation_sharding)
-                    batched_y = jax.device_put(einops.rearrange(y, "(a b) s -> a b s", a=n_grad_acc), activation_sharding)
-                    batched_m = jax.device_put(einops.rearrange(m, "(a b) s -> a b s", a=n_grad_acc), activation_sharding)
-                    yield batched_x, batched_y, batched_m
+                    batched_x = jax.device_put(
+                        einops.rearrange(x, "(a b) s -> a b s", a=n_grad_acc), activation_sharding
+                    )
+                    batched_y = jax.device_put(
+                        einops.rearrange(y, "(a b) s -> a b s", a=n_grad_acc), activation_sharding
+                    )
+                    if data_has_masks:
+                        batched_m = jax.device_put(
+                            einops.rearrange(m, "(a b) s -> a b s", a=n_grad_acc), activation_sharding
+                        )
+                        yield batched_x, batched_y, batched_m
+                    else:
+                        yield batched_x, batched_y
                 else:
-                    # buf shape: (tokens_per_batch + 1,)
+                    # 1D layout: raw tokens only (autoregressive)
                     x = np.array(buf[:-1], dtype=np.int32).reshape(num_samples, seq_len)
                     y = np.array(buf[1:], dtype=np.int32).reshape(num_samples, seq_len)
 
                     # Reshape and shard
-                    batched_x = jax.device_put(einops.rearrange(x, "(a b) s -> a b s", a=n_grad_acc), activation_sharding)
-                    batched_y = jax.device_put(einops.rearrange(y, "(a b) s -> a b s", a=n_grad_acc), activation_sharding)
+                    batched_x = jax.device_put(
+                        einops.rearrange(x, "(a b) s -> a b s", a=n_grad_acc), activation_sharding
+                    )
+                    batched_y = jax.device_put(
+                        einops.rearrange(y, "(a b) s -> a b s", a=n_grad_acc), activation_sharding
+                    )
                     yield batched_x, batched_y
 
                 cursor += tokens_per_batch
