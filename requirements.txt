@@ -12,3 +12,4 @@ numba
 autopep8
 networkx
 pydot
+tpu-info
