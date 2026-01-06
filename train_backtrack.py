@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import numpy as np
 import numba as nb
 from jax import vmap
+from dataclasses import dataclass
 
 import matplotlib
 from matplotlib import pyplot as plt
@@ -17,6 +18,53 @@ from tqdm import tqdm
 
 import model
 import train
+
+
+@dataclass
+class DatasetConfig:
+    """Configuration for backtrack task dataset generation."""
+    dataset_name: str = 'backtracktask'
+    n_edges: int = 30  # number of edges per DAG
+    n_interleaved: int = 2  # number of DAGs interleaved together
+    branching_factor: int = 2  # branching factor of the tree
+    height: int = 5  # tree height (starting from level 1, ending at level `height`)
+    n_data: int = 2**21 * 3  # total number of data samples
+    n_data_batch: int = 2**19  # batch size for data generation
+    seed: int = 123  # base seed for random generation
+
+    @property
+    def n_nodes(self) -> int:
+        """Number of nodes in the un-sampled balanced tree."""
+        if self.branching_factor == 1:
+            return self.height
+        return (self.branching_factor ** self.height - 1) // (self.branching_factor - 1)
+
+    @property
+    def adj_list_len(self) -> int:
+        """Length of adjacency list: 3 tokens per edge pair, +1 for root self-loops."""
+        return 3 * (self.n_edges + 1)
+
+    @property
+    def sample_len(self) -> int:
+        """Total sample length."""
+        return self.adj_list_len * self.n_interleaved
+
+    @property
+    def token_arr(self) -> np.ndarray:
+        """Token array including separator token."""
+        return np.arange((self.n_edges + 1) * self.n_interleaved + 1, dtype=np.uint16)
+
+    @property
+    def num_passes(self) -> int:
+        """Number of passes for data generation."""
+        return self.n_data // self.n_data_batch
+
+    def validate(self) -> None:
+        """Validate configuration parameters."""
+        assert self.n_nodes >= self.n_edges + 1, \
+            f"Balanced tree too small: n_nodes={self.n_nodes} < n_edges+1={self.n_edges + 1}"
+
+jax.distributed.initialize()
 
 
 def heatmap(data, row_labels, col_labels, ax=None, **kwargs):
@@ -354,34 +402,29 @@ def compact_nodes_many(interleaved_edges: np.ndarray):
 
 
 
-dataset_name = 'backtracktask'
-n_edges = 30
-n_interleaved = 2
-branching_factor = 2
-height = 5  # starting from level 1, ending at level `height`
-assert balanced_tree_nnodes(branching_factor, height) >= n_edges+1 # if the balanced tree is too small, we can't have that many edges
-adj_list_len = 3*(n_edges+1) # 3 tok per edge pair, additional 1 tok for root self-loops
-sample_len = adj_list_len * n_interleaved
-token_arr = np.arange((n_edges+1)*n_interleaved + 1, dtype=np.uint16) # +1 for the separator
-n_nodes = balanced_tree_nnodes(branching_factor, height) # number of nodes in the un-sampled tree
-n_data = 2**21*3
-n_data_batch = 2**19
+# Create dataset configuration
+data_cfg = DatasetConfig(
+    dataset_name='backtracktask',
+    n_edges=30,
+    n_interleaved=2,
+    branching_factor=2,
+    height=5,
+    n_data=2**21 * 3,
+    n_data_batch=2**19,
+    seed=123,
+)
+data_cfg.validate()
 
+print(f"Token count: {data_cfg.token_arr.shape}")
 
-print(f"Token count: {token_arr.shape}")
-
-
-# repeat the data-generation and permutation logic, saving to file as we go using memmaps.
-num_passes = n_data // n_data_batch
-
-if not os.path.exists(dataset_name):
-    os.makedirs(dataset_name)
+if not os.path.exists(data_cfg.dataset_name):
+    os.makedirs(data_cfg.dataset_name)
 
 def make_memmap(path, shape, dtype):
     print(f"Creating memmap for {path} with shape {shape} and dtype {dtype}")
     return np.memmap(path, mode='w+', dtype=dtype, shape=shape)
 
-total_len = n_data * sample_len
+total_len = data_cfg.n_data * data_cfg.sample_len
 n_rows = 3
 val_len = total_len // 16
 
@@ -389,27 +432,27 @@ val_len = total_len // 16
 train_shape = (n_rows, total_len - val_len)
 val_shape   = (n_rows, val_len)
 
-print(f"Opening train memmap: {os.path.join(dataset_name, 'train_with_mask_n_targets.bin')}")
-train_mm = make_memmap(os.path.join(dataset_name, 'train_with_mask_n_targets.bin'), train_shape, np.uint16)
-print(f"Opening val memmap: {os.path.join(dataset_name, 'val_with_mask_n_targets.bin')}")
-val_mm   = make_memmap(os.path.join(dataset_name, 'val_with_mask_n_targets.bin'),   val_shape,   np.uint16)
+print(f"Opening train memmap: {os.path.join(data_cfg.dataset_name, 'train_with_mask_n_targets.bin')}")
+train_mm = make_memmap(os.path.join(data_cfg.dataset_name, 'train_with_mask_n_targets.bin'), train_shape, np.uint16)
+print(f"Opening val memmap: {os.path.join(data_cfg.dataset_name, 'val_with_mask_n_targets.bin')}")
+val_mm   = make_memmap(os.path.join(data_cfg.dataset_name, 'val_with_mask_n_targets.bin'),   val_shape,   np.uint16)
 
 train_pos = 0
 val_pos = 0
 
-for rep in tqdm(range(num_passes)):
-    edges = sample_interleaved_edges_many(branching_factor, height, n_edges, n_interleaved, n_data_batch, seed0=123+rep)
-    levels = np.ceil(np.log((((edges % n_nodes)+1) * (branching_factor - 1))+1) / np.log(branching_factor))
+for rep in tqdm(range(data_cfg.num_passes)):
+    edges = sample_interleaved_edges_many(data_cfg.branching_factor, data_cfg.height, data_cfg.n_edges, data_cfg.n_interleaved, data_cfg.n_data_batch, seed0=data_cfg.seed+rep)
+    levels = np.ceil(np.log((((edges % data_cfg.n_nodes)+1) * (data_cfg.branching_factor - 1))+1) / np.log(data_cfg.branching_factor))
     compacted = compact_nodes_many(edges)
-    roots_tiled = np.tile(np.arange(n_interleaved)*(n_edges+1), (n_data_batch, 1))
-    root_self_loops = np.repeat(roots_tiled, 2, axis=-1).reshape(compacted.shape[0], n_interleaved, 2)
+    roots_tiled = np.tile(np.arange(data_cfg.n_interleaved)*(data_cfg.n_edges+1), (data_cfg.n_data_batch, 1))
+    root_self_loops = np.repeat(roots_tiled, 2, axis=-1).reshape(compacted.shape[0], data_cfg.n_interleaved, 2)
     compacted_with_root_self_loops = np.concatenate([root_self_loops, compacted], axis=-2)
-    data = np.concatenate([token_arr[-1]*np.ones_like(compacted_with_root_self_loops), compacted_with_root_self_loops], axis=-1)[:,:,1:]
+    data = np.concatenate([data_cfg.token_arr[-1]*np.ones_like(compacted_with_root_self_loops), compacted_with_root_self_loops], axis=-1)[:,:,1:]
     targets = np.zeros_like(data)
-    targets[..., 2::3] = (data[..., 2::3] // (n_edges+1)) * (n_edges+1)
-    labels = np.concatenate([np.ones((len(levels), n_interleaved, 2)), levels], axis=1)
+    targets[..., 2] = (data[..., 2] // (data_cfg.n_edges+1)) * (data_cfg.n_edges+1)
+    labels = np.concatenate([np.ones((len(levels), data_cfg.n_interleaved, 2)), levels], axis=1)
     labels = np.concatenate([np.zeros_like(labels), labels], axis=2)[:,:,1:] # result has last dim like [0, depth, depth]
-    def include_labels(labels, included=np.array([1, 4, 5])):
+    def include_labels(labels, included=np.array([1, 2, 5])):
         return np.isin(labels, included)
     mask = include_labels(labels).astype(np.uint16)
     mask[..., :2] = 0 # only keep child tokens in the loss
@@ -421,14 +464,14 @@ for rep in tqdm(range(num_passes)):
         jnp.array(labels, dtype=jnp.uint16)
     )
     key_d2 = jax.random.PRNGKey(2 + rep)
-    key_perms = jax.random.split(key_d2, n_data_batch)
+    key_perms = jax.random.split(key_d2, data_cfg.n_data_batch)
     print("Generating token permutations (this can be slow)...")
     tok_permutations = vmap(lambda k : jnp.concatenate(
-        [jax.random.permutation(k, len(token_arr)-1), token_arr[-1:]]
+        [jax.random.permutation(k, len(data_cfg.token_arr)-1), data_cfg.token_arr[-1:]]
     ))(key_perms)
     print("Applying permutations to data and targets (this can be slow)...")
-    data_from_perms = vmap(lambda i : tok_permutations[i][data.reshape(n_data_batch, -1)[i]])(jnp.arange(n_data_batch))
-    targets_from_perms = vmap(lambda i : tok_permutations[i][targets.reshape(n_data_batch, -1)[i]])(jnp.arange(n_data_batch))
+    data_from_perms = vmap(lambda i : tok_permutations[i][data.reshape(data_cfg.n_data_batch, -1)[i]])(jnp.arange(data_cfg.n_data_batch))
+    targets_from_perms = vmap(lambda i : tok_permutations[i][targets.reshape(data_cfg.n_data_batch, -1)[i]])(jnp.arange(data_cfg.n_data_batch))
     
     data_from_perms_flat, targets_from_perms_flat = data_from_perms.flatten(), targets_from_perms.flatten()
     mask_flat, labels_flat = mask.flatten(), labels.flatten()
@@ -436,7 +479,7 @@ for rep in tqdm(range(num_passes)):
         data_from_perms_flat, targets_from_perms_flat, mask_flat #, labels_flat
     ], axis=0)
     val_data_len = data_with_mask_n_targets.shape[1] // 16
-    assert val_data_len == val_len // num_passes
+    assert val_data_len == val_len // data_cfg.num_passes
     train_ids = data_with_mask_n_targets[:, :-val_data_len].astype(np.uint16)
     val_ids = data_with_mask_n_targets[:, -val_data_len:].astype(np.uint16)
 
@@ -447,7 +490,7 @@ for rep in tqdm(range(num_passes)):
     train_pos += train_ids.shape[1]
     val_pos += val_ids.shape[1]
 
-    print(f"Pass {rep+1}/{num_passes} done. train_pos={train_pos}, val_pos={val_pos}")
+    print(f"Pass {rep+1}/{data_cfg.num_passes} done. train_pos={train_pos}, val_pos={val_pos}")
 
 print("Flushing memmaps to disk...")
 train_mm.flush()
@@ -456,7 +499,7 @@ print("Done!")
 
 
 def extract_interleaved_edges(x, sample_ind = 0):
-    return x[sample_ind*sample_len : (sample_ind+1)*sample_len]
+    return x[sample_ind*data_cfg.sample_len : (sample_ind+1)*data_cfg.sample_len]
 
 i = 0
 G = nx.DiGraph()
@@ -469,18 +512,18 @@ nx.draw(
     node_color="lightblue", edge_color="gray",
     width=0.8, arrows=True, arrowsize=10
 )
-plt.savefig(f"{dataset_name}/example_input.png", bbox_inches="tight")
+plt.savefig(f"{data_cfg.dataset_name}/example_input.png", bbox_inches="tight")
 plt.close()
 
 
 
 config = train.TrainConfig(
-    input_bin=f"{dataset_name}/train_with_mask_n_targets.bin",
-    input_val_bin=f"{dataset_name}/val_with_mask_n_targets.bin",
+    input_bin=f"{data_cfg.dataset_name}/train_with_mask_n_targets.bin",
+    input_val_bin=f"{data_cfg.dataset_name}/val_with_mask_n_targets.bin",
     embd_dim = 512,
     head_dim = 256,
     n_layer = 5,
-    block_size = sample_len, # should match the task sequence length so tasks are independently trained on
+    block_size = data_cfg.sample_len, # should match the task sequence length so tasks are independently trained on
     batch_size = 256,
     gradient_accumulation_steps = 1,
     max_iters = 100_000,
@@ -489,16 +532,16 @@ config = train.TrainConfig(
     min_lr = 0,
     warmup_iters = 5_000,
     lr_decay_iters = 100_000,
-    vocab_size = len(token_arr),
+    vocab_size = len(data_cfg.token_arr),
     use_masked_loss = True,
     use_custom_target=True,
     use_mlp = False,
     off_by_one_attn = False,
     use_pope = True,
     # freeze_params=("wte",),
-    max_seq_len = 2*sample_len,
+    max_seq_len = 2*data_cfg.sample_len,
 
-    pos_encoding_base = 2*sample_len,
+    pos_encoding_base = 2*data_cfg.sample_len,
     
     log_interval = 10_000,
     eval_interval = 1_000,
@@ -511,14 +554,14 @@ params = train.train_loop(config)
 print("FINISHED TRAINING")
 print("Saving config and params")
 # save config and params using numpy
-np.savez(f"{dataset_name}/config.npz", config=config)
-np.savez(f"{dataset_name}/params.npz", params=params)
+np.savez(f"{data_cfg.dataset_name}/config.npz", config=config)
+np.savez(f"{data_cfg.dataset_name}/params.npz", params=params)
 
 
 
 # load config and params using numpy
-config = np.load(f"{dataset_name}/config.npz", allow_pickle=True)["config"].item()
-params = np.load(f"{dataset_name}/params.npz", allow_pickle=True)["params"].item()
+config = np.load(f"{data_cfg.dataset_name}/config.npz", allow_pickle=True)["config"].item()
+params = np.load(f"{data_cfg.dataset_name}/params.npz", allow_pickle=True)["params"].item()
 
 print(config)
 print(params)
@@ -549,8 +592,8 @@ preds, attn_weights = model.gpt_forward(params, rope_params, test_input_ids[None
 res = preds[0].argmax(axis=-1)
 
 
-query_subset = jnp.arange(2, sample_len, 3)
-key_subset = jnp.concatenate([jnp.arange(1, sample_len, 3)[None, :], jnp.arange(2, sample_len, 3)[None, :]]).T.flatten()
+query_subset = jnp.arange(2, data_cfg.sample_len, 3)
+key_subset = jnp.concatenate([jnp.arange(1, data_cfg.sample_len, 3)[None, :], jnp.arange(2, data_cfg.sample_len, 3)[None, :]]).T.flatten()
 
 # Determine num_layers and num_heads from attn_weights structure
 num_layers = len(attn_weights)

@@ -462,12 +462,27 @@ def loss_fn(
     pos_params: PyTree,
     dropout_key: Optional[PRNGKey] = None,
     training: bool = False,
-) -> jax.Array:
+    num_loss_groups: Optional[int] = None,
+    loss_combiner: Optional[callable] = None,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Cross-entropy loss for language modeling with optional mask.
     
     Args:
-        batch: Either (idx, targets) or (idx, targets, mask) where mask is a {0,1}
-               array indicating which positions to include in the loss.
+        batch: Either (idx, targets) or (idx, targets, mask) where:
+               - For binary masks: mask is {0,1} array (0=ignore, 1=include)
+               - For grouped masks: mask contains consecutive positive integers (1, 2, ..., num_loss_groups)
+                 where 0 means ignore and each positive integer represents a loss group.
+        num_loss_groups: Maximum mask value for grouped loss computation. If provided along with
+                        loss_combiner, enables segment-based loss computation where each mask value
+                        (1 to num_loss_groups) represents a separate loss group.
+        loss_combiner: Callable that takes an array of mean losses per group (shape: num_loss_groups,)
+                      and returns a scalar combined loss for gradient computation.
+                      If None with num_loss_groups, defaults to mean of all group losses.
+    
+    Returns:
+        If num_loss_groups is provided: (combined_loss, individual_losses) where individual_losses
+            is shape (num_loss_groups,) containing mean loss for each group.
+        Otherwise: scalar loss value.
     """
     if len(batch) == 3:
         idx, targets, mask = batch
@@ -482,15 +497,54 @@ def loss_fn(
     target_log_probs = jnp.take_along_axis(
         log_probs, jnp.expand_dims(targets, axis=-1), axis=-1
     ).squeeze(-1)
+    
+    # Per-token loss (positive, since we negate later or use directly)
+    token_losses = -target_log_probs
 
-    if mask is not None:
-        # Masked loss: sum of masked losses / sum of active mask elements
-        # assert same shape
+    if mask is not None and num_loss_groups is not None:
+        # Grouped loss computation using segment_sum
+        # mask values: 0=ignore, 1..num_loss_groups = different loss groups
         assert target_log_probs.shape == mask.shape
-        masked_loss = -target_log_probs * mask
+        
+        # Flatten for segment operations
+        mask_flat = mask.flatten().astype(jnp.uint16)
+        losses_flat = token_losses.flatten()
+        
+        # Compute sum of losses per segment (index 0 = ignored positions)
+        # num_segments = num_loss_groups + 1 to include segment 0
+        loss_sums = jax.ops.segment_sum(
+            losses_flat, mask_flat, num_segments=num_loss_groups + 1
+        )
+        
+        # Compute count per segment
+        counts = jax.ops.segment_sum(
+            jnp.ones_like(losses_flat), mask_flat, num_segments=num_loss_groups + 1
+        )
+        
+        # Mean loss per segment (avoid division by zero with max(count, 1))
+        # For empty segments, this gives 0/1 = 0 loss
+        mean_losses_all = loss_sums / jnp.maximum(counts, 1.0)
+        
+        # Extract losses for groups 1..num_loss_groups (exclude segment 0 which is ignored)
+        individual_losses = mean_losses_all[1:]  # shape (num_loss_groups,)
+        
+        # Combine losses for gradient computation
+        if loss_combiner is not None:
+            combined_loss = loss_combiner(individual_losses)
+        else:
+            # Default: mean of all group losses (only non-empty groups)
+            group_active = counts[1:] > 0
+            combined_loss = jnp.sum(individual_losses * group_active) / jnp.maximum(jnp.sum(group_active), 1.0)
+        
+        return combined_loss, individual_losses
+    
+    elif mask is not None:
+        # Binary mask: sum of masked losses / sum of active mask elements
+        assert target_log_probs.shape == mask.shape
+        masked_loss = token_losses * mask
         return jnp.sum(masked_loss) / jnp.sum(mask)
     else:
-        return -jnp.mean(target_log_probs)
+        return jnp.mean(token_losses)
 
 
 def get_num_params(params: PyTree) -> int:

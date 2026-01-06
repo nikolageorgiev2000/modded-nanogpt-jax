@@ -54,7 +54,7 @@ import datetime
 import pickle
 import itertools
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, Union
 
 import jax
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
@@ -323,6 +323,15 @@ class TrainConfig:
     # Examples: ("wte",) to freeze embeddings, ("h.0.", "h.1.") to freeze first two layers
     freeze_params: tuple[str, ...] = ()
 
+    # Grouped loss computation - for masks with consecutive positive integer values
+    # num_loss_groups: max mask value (e.g., 3 means mask values 1, 2, 3 are valid groups)
+    # loss_combiner: callable that takes array of shape (num_loss_groups,) with mean loss per group
+    #                and returns a scalar combined loss for gradient computation.
+    #                If None, defaults to mean of all active group losses.
+    # Example: loss_combiner=lambda losses: losses[0] + 0.5 * losses[1]  # weight different groups
+    num_loss_groups: Optional[int] = None
+    loss_combiner: Optional[Callable[[Any], Any]] = None
+
     @property
     def data_has_masks(self) -> bool:
         # needed to load data with the right shape (2, ntok)
@@ -345,6 +354,29 @@ class TrainConfig:
                 f"use_custom_target=True requires data with targets (filenames containing 'target'), "
                 f"but input paths are '{self.input_bin}' and '{self.input_val_bin}'"
             )
+        if self.num_loss_groups is not None:
+            assert self.data_has_masks, (
+                f"num_loss_groups={self.num_loss_groups} requires data with masks (filenames containing 'mask'), "
+                f"but input paths are '{self.input_bin}' and '{self.input_val_bin}'"
+            )
+            assert self.num_loss_groups > 0, f"num_loss_groups must be positive, got {self.num_loss_groups}"
+        if self.loss_combiner is not None:
+            assert self.num_loss_groups is not None and self.num_loss_groups > 0, (
+                f"loss_combiner requires num_loss_groups to be set to a positive value, "
+                f"but num_loss_groups={self.num_loss_groups}"
+            )
+            # Validate that loss_combiner can process an array of the expected length
+            dummy_losses = np.ones(self.num_loss_groups, dtype=np.float32)
+            try:
+                result = self.loss_combiner(dummy_losses)
+                # Check result is scalar-like
+                assert np.ndim(result) == 0, (
+                    f"loss_combiner must return a scalar, but returned array with shape {np.shape(result)}"
+                )
+            except Exception as e:
+                raise AssertionError(
+                    f"loss_combiner failed to process dummy array of length {self.num_loss_groups}: {e}"
+                ) from e
         assert self.max_seq_len >= self.block_size, f"max_seq_len must be greater than or equal to block_size, got {self.max_seq_len} and {self.block_size}"
 
     def get_model_config(self) -> GPTConfig:
@@ -488,6 +520,8 @@ def load_dataset(
     # Whether training will *use* these fields
     use_masked_loss = bool(getattr(config, "use_masked_loss", False))
     use_custom_target = bool(getattr(config, "use_custom_target", False))
+    num_loss_groups = getattr(config, "num_loss_groups", None)
+    use_grouped_loss = num_loss_groups is not None
 
     n_rows = 1 + (1 if data_has_targets else 0) + (1 if data_has_masks else 0)
 
@@ -647,17 +681,26 @@ def load_dataset(
                         x = np.array(chunks, dtype=np.int32).reshape(num_samples, seq_len)
                         y = np.array(targets, dtype=np.int32).reshape(num_samples, seq_len)
                         if data_has_masks:
-                            # Normalize mask to {0, 1}: any non-zero value becomes 1
-                            m = (masks > 0).astype(np.float32).reshape(num_samples, seq_len)
+                            if use_grouped_loss:
+                                # Keep original mask values (1, 2, ..., num_loss_groups) as uint16
+                                m = np.array(masks, dtype=np.uint16).reshape(num_samples, seq_len)
+                            else:
+                                # Normalize mask to {0, 1}: any non-zero value becomes 1
+                                m = (masks > 0).astype(np.float32).reshape(num_samples, seq_len)
                     else:
                         # Autoregressive targets from shifted tokens
                         x = np.array(chunks[:-1], dtype=np.int32).reshape(num_samples, seq_len)
                         y = np.array(chunks[1:], dtype=np.int32).reshape(num_samples, seq_len)
-                        # Normalize mask to {0, 1}: any non-zero value becomes 1
-                        m = (masks[1:] > 0).astype(np.float32).reshape(num_samples, seq_len)
+                        if data_has_masks:
+                            if use_grouped_loss:
+                                # Keep original mask values (1, 2, ..., num_loss_groups) as uint16
+                                m = np.array(masks[1:], dtype=np.uint16).reshape(num_samples, seq_len)
+                            else:
+                                # Normalize mask to {0, 1}: any non-zero value becomes 1
+                                m = (masks[1:] > 0).astype(np.float32).reshape(num_samples, seq_len)
 
                     # If use_masked_loss=False or no masks available, disable masking by using ones.
-                    if data_has_masks and not use_masked_loss:
+                    if data_has_masks and not use_masked_loss and not use_grouped_loss:
                             m = np.ones_like(m)
 
                     # Reshape and shard
@@ -711,28 +754,53 @@ def train_step(
     batched_y: jax.Array,
     batched_mask: Optional[jax.Array] = None,
     freeze_mask: Optional[PyTree] = None,
+    num_loss_groups: Optional[int] = None,
+    loss_combiner: Optional[Callable] = None,
 ) -> tuple[PyTree, PyTree, dict]:
     """Single training step with gradient accumulation.
     
     Args:
         batched_mask: Optional mask array of shape (n_grad_acc, batch_size, seq_len).
                       If provided, the loss will be computed only on masked positions.
+                      For grouped loss: contains consecutive positive integers (1..num_loss_groups).
         freeze_mask: Optional boolean mask tree where True = trainable, False = frozen.
                      Frozen parameters will have their gradients zeroed out.
+        num_loss_groups: Maximum mask value for grouped loss computation.
+        loss_combiner: Callable to combine individual group losses into a scalar.
     """
     n_grad_acc_steps = batched_x.shape[0]
+    use_grouped_loss = num_loss_groups is not None
 
     def loss_and_grad_fn(p, micro_batch):
-        return value_and_grad(loss_fn)(p, micro_batch, model_config, precomputed_params, training=False)
+        def _loss_fn(params):
+            return loss_fn(
+                params, micro_batch, model_config, precomputed_params,
+                training=False, num_loss_groups=num_loss_groups, loss_combiner=loss_combiner
+            )
+        if use_grouped_loss:
+            # Returns (combined_loss, individual_losses), need has_aux=True
+            return value_and_grad(_loss_fn, has_aux=True)(p)
+        else:
+            return value_and_grad(_loss_fn)(p)
 
-    def micro_step(carry, micro_batch):
-        accum_grads, total_loss = carry
-        loss, grads = loss_and_grad_fn(params, micro_batch)
-        new_accum_grads = tree_map(jnp.add, accum_grads, grads)
-        return (new_accum_grads, total_loss + loss), None
+    if use_grouped_loss:
+        def micro_step(carry, micro_batch):
+            accum_grads, total_loss, total_individual_losses = carry
+            (loss, individual_losses), grads = loss_and_grad_fn(params, micro_batch)
+            new_accum_grads = tree_map(jnp.add, accum_grads, grads)
+            return (new_accum_grads, total_loss + loss, total_individual_losses + individual_losses), None
 
-    zero_grads = tree_map(jnp.zeros_like, params)
-    init_carry = (zero_grads, 0.0)
+        zero_grads = tree_map(jnp.zeros_like, params)
+        init_carry = (zero_grads, 0.0, jnp.zeros(num_loss_groups, dtype=jnp.float32))
+    else:
+        def micro_step(carry, micro_batch):
+            accum_grads, total_loss = carry
+            loss, grads = loss_and_grad_fn(params, micro_batch)
+            new_accum_grads = tree_map(jnp.add, accum_grads, grads)
+            return (new_accum_grads, total_loss + loss), None
+
+        zero_grads = tree_map(jnp.zeros_like, params)
+        init_carry = (zero_grads, 0.0)
     
     # Build scan input tuple: (x, y) or (x, y, mask)
     if batched_mask is not None:
@@ -740,9 +808,15 @@ def train_step(
     else:
         scan_input = (batched_x, batched_y)
     
-    (final_grads_accum, total_loss), _ = scan(
-        micro_step, init_carry, scan_input
-    )
+    if use_grouped_loss:
+        (final_grads_accum, total_loss, total_individual_losses), _ = scan(
+            micro_step, init_carry, scan_input
+        )
+        avg_individual_losses = total_individual_losses / n_grad_acc_steps
+    else:
+        (final_grads_accum, total_loss), _ = scan(
+            micro_step, init_carry, scan_input
+        )
 
     avg_loss = total_loss / n_grad_acc_steps
     final_grads = tree_map(
@@ -761,36 +835,75 @@ def train_step(
     updates, new_opt_state = optimizer.update(final_grads, opt_state, params)
     new_params = optax.apply_updates(params, updates)
 
-    return new_params, new_opt_state, {"loss": avg_loss}
+    metrics = {"loss": avg_loss}
+    if use_grouped_loss:
+        metrics["individual_losses"] = avg_individual_losses
+
+    return new_params, new_opt_state, metrics
 
 
 def eval_step(
+    model_config: GPTConfig,
     params: PyTree,
+    precomputed_params: PyTree,
     batched_x: jax.Array,
     batched_y: jax.Array,
-    model_config: GPTConfig,
-    precomputed_params: PyTree,
     batched_mask: Optional[jax.Array] = None,
-) -> jax.Array:
+    num_loss_groups: Optional[int] = None,
+    loss_combiner: Optional[Callable] = None,
+) -> Union[jax.Array, tuple[jax.Array, jax.Array]]:
     """Evaluation step.
     
     Args:
+        model_config: Model configuration (static).
+        params: Model parameters.
+        precomputed_params: Precomputed positional embeddings.
+        batched_x: Input token IDs of shape (n_grad_acc, batch_size, seq_len).
+        batched_y: Target token IDs of shape (n_grad_acc, batch_size, seq_len).
         batched_mask: Optional mask array of shape (n_grad_acc, batch_size, seq_len).
                       If provided, the loss will be computed only on masked positions.
+        num_loss_groups: Maximum mask value for grouped loss computation (static).
+        loss_combiner: Callable to combine individual group losses into a scalar (static).
+    
+    Returns:
+        If num_loss_groups is provided: (avg_loss, avg_individual_losses)
+        Otherwise: avg_loss (scalar)
     """
     n_grad_acc_steps = batched_x.shape[0]
+    use_grouped_loss = num_loss_groups is not None
 
-    def loss_loop_body(i, accumulated_loss):
-        if batched_mask is not None:
-            micro_batch = (batched_x[i], batched_y[i], batched_mask[i])
-        else:
-            micro_batch = (batched_x[i], batched_y[i])
-        loss = loss_fn(params, micro_batch, model_config, precomputed_params, training=False)
-        return accumulated_loss + loss
+    if use_grouped_loss:
+        def loss_loop_body(i, carry):
+            accumulated_loss, accumulated_individual_losses = carry
+            if batched_mask is not None:
+                micro_batch = (batched_x[i], batched_y[i], batched_mask[i])
+            else:
+                micro_batch = (batched_x[i], batched_y[i])
+            loss, individual_losses = loss_fn(
+                params, micro_batch, model_config, precomputed_params, 
+                training=False, num_loss_groups=num_loss_groups, loss_combiner=loss_combiner
+            )
+            return accumulated_loss + loss, accumulated_individual_losses + individual_losses
 
-    total_loss = jax.lax.fori_loop(0, n_grad_acc_steps, loss_loop_body, 0.0)
-    avg_loss = total_loss / n_grad_acc_steps
-    return avg_loss
+        init_carry = (0.0, jnp.zeros(num_loss_groups, dtype=jnp.float32))
+        total_loss, total_individual_losses = jax.lax.fori_loop(
+            0, n_grad_acc_steps, loss_loop_body, init_carry
+        )
+        avg_loss = total_loss / n_grad_acc_steps
+        avg_individual_losses = total_individual_losses / n_grad_acc_steps
+        return avg_loss, avg_individual_losses
+    else:
+        def loss_loop_body(i, accumulated_loss):
+            if batched_mask is not None:
+                micro_batch = (batched_x[i], batched_y[i], batched_mask[i])
+            else:
+                micro_batch = (batched_x[i], batched_y[i])
+            loss = loss_fn(params, micro_batch, model_config, precomputed_params, training=False)
+            return accumulated_loss + loss
+
+        total_loss = jax.lax.fori_loop(0, n_grad_acc_steps, loss_loop_body, 0.0)
+        avg_loss = total_loss / n_grad_acc_steps
+        return avg_loss
 
 
 def run_evaluation(
@@ -801,21 +914,46 @@ def run_evaluation(
     logger,
     compiled_eval_fn: Callable,
     config: TrainConfig,
-):
-    """Run validation loop."""
+) -> Union[float, tuple[float, jax.Array]]:
+    """Run validation loop.
+    
+    Returns:
+        If config.num_loss_groups is set: (final_val_loss, final_individual_losses)
+        Otherwise: final_val_loss (scalar)
+    """
     logger.msg(f"Running validation for step {step}...")
     val_loss_accum = 0.0
     val_steps = 0
+    has_mask = config.data_has_masks
+    use_grouped_loss = config.num_loss_groups is not None
+    
+    if use_grouped_loss:
+        val_individual_losses_accum = jnp.zeros(config.num_loss_groups, dtype=jnp.float32)
     
     for batch in val_loader:
-        # Unpack x, y, (mask) and call with precomputed_params
-        loss = compiled_eval_fn(params, *batch[:2], precomputed_params, *batch[2:])
+        # Call compiled_eval_fn with args matching eval_step signature (minus static args)
+        # Non-static args: params, precomputed_params, batched_x, batched_y, batched_mask
+        result = compiled_eval_fn(params, precomputed_params, batch[0], batch[1], batch[2] if has_mask else None)
+        
+        if use_grouped_loss:
+            loss, individual_losses = result
+            val_individual_losses_accum = val_individual_losses_accum + individual_losses
+        else:
+            loss = result
+        
         val_loss_accum += loss
         val_steps += 1
+    
     if val_steps == 0:
         logger.msg("Warning: Validation loader was empty, no validation was run.")
         return
+    
     final_val_loss = val_loss_accum / val_steps
+    
+    if use_grouped_loss:
+        final_individual_losses = val_individual_losses_accum / val_steps
+        return final_val_loss, final_individual_losses
+    
     return final_val_loss
 
 
@@ -899,10 +1037,10 @@ def train_loop(config: TrainConfig):
         # JIT compile training and evaluation functions
         jitted_train_step = jit(
             train_step,
-            static_argnames=("model_config", "optimizer"),
-            donate_argnums=(1, 3), # Updated donate_argnums because params is now arg 1 and opt_state is arg 3
+            static_argnames=("model_config", "optimizer", "num_loss_groups", "loss_combiner"),
+            donate_argnums=(1, 3),  # Donate params (arg 1) and opt_state (arg 3) buffers
         )
-        jitted_eval_step = jit(eval_step, static_argnames=("model_config",))
+        jitted_eval_step = jit(eval_step, static_argnames=("model_config", "num_loss_groups", "loss_combiner"))
 
         # AOT compile for the fixed batch shape
         # Load datasets
@@ -930,41 +1068,36 @@ def train_loop(config: TrainConfig):
         dummy_x = jax.device_put(dummy_x, activation_sharding)
         dummy_y = jax.device_put(dummy_y, activation_sharding)
         
+        # Get grouped loss settings
+        num_loss_groups = config.num_loss_groups
+        loss_combiner = config.loss_combiner
+        use_grouped_loss = num_loss_groups is not None
+        
+        if use_grouped_loss:
+            logger.msg(f"Using grouped loss with {num_loss_groups} groups")
+            if loss_combiner is not None:
+                logger.msg("Custom loss combiner function configured")
+        
+        # Create dummy mask if data has masks (None otherwise)
+        dummy_mask = None
         if has_mask:
-            dummy_mask = jnp.ones((n_grad_acc, config.batch_size, seq_len), dtype=jnp.float32)
-            dummy_mask = jax.device_put(dummy_mask, activation_sharding)
-            
-            compiled_train_step = jitted_train_step.lower(
-                model_config,
-                params,
-                precomputed_params,
-                opt_state,
-                optimizer,
-                dummy_x,
-                dummy_y,
-                dummy_mask,
-                freeze_mask,
-            ).compile()
+            mask_dtype = jnp.uint16 if use_grouped_loss else jnp.float32
+            dummy_mask = jax.device_put(
+                jnp.ones((n_grad_acc, config.batch_size, seq_len), dtype=mask_dtype),
+                activation_sharding
+            )
+        
+        compiled_train_step = jitted_train_step.lower(
+            model_config, params, precomputed_params, opt_state, optimizer,
+            dummy_x, dummy_y, dummy_mask, freeze_mask,
+            num_loss_groups, loss_combiner,
+        ).compile()
 
-            compiled_eval_step = jitted_eval_step.lower(
-                params, dummy_x, dummy_y, model_config, precomputed_params, dummy_mask
-            ).compile()
-        else:
-            compiled_train_step = jitted_train_step.lower(
-                model_config,
-                params,
-                precomputed_params,
-                opt_state,
-                optimizer,
-                dummy_x,
-                dummy_y,
-                None,  # batched_mask
-                freeze_mask,
-            ).compile()
-
-            compiled_eval_step = jitted_eval_step.lower(
-                params, dummy_x, dummy_y, model_config, precomputed_params
-            ).compile()
+        compiled_eval_step = jitted_eval_step.lower(
+            model_config, params, precomputed_params,
+            dummy_x, dummy_y, dummy_mask,
+            num_loss_groups, loss_combiner
+        ).compile()
         logger.msg("AOT compilation finished.")
 
         # Training loop
@@ -979,7 +1112,7 @@ def train_loop(config: TrainConfig):
 
             # Evaluation
             if step % config.eval_interval == 0:
-                val_loss = run_evaluation(
+                val_result = run_evaluation(
                     step,
                     params,
                     precomputed_params,
@@ -988,7 +1121,14 @@ def train_loop(config: TrainConfig):
                     compiled_eval_step,
                     config,
                 )
-                log_dict["val_loss"] = val_loss
+                if use_grouped_loss:
+                    val_loss, val_individual_losses = val_result
+                    log_dict["val_loss"] = val_loss
+                    # Log individual validation losses per group
+                    for i in range(num_loss_groups):
+                        log_dict[f"val_loss_group_{i+1}"] = float(val_individual_losses[i])
+                else:
+                    log_dict["val_loss"] = val_result
             
             # Training: compiled_train_step(params, precomputed, opt_state, x, y, [mask], freeze_mask)
             params, opt_state, metrics = compiled_train_step(
@@ -1006,8 +1146,13 @@ def train_loop(config: TrainConfig):
                 log_dict.update({
                     "step": step,
                     "lr": current_lr,
-                    **metrics,
+                    "loss": metrics["loss"],
                 })
+                
+                # Log individual training losses per group
+                if use_grouped_loss and "individual_losses" in metrics:
+                    for i in range(num_loss_groups):
+                        log_dict[f"loss_group_{i+1}"] = float(metrics["individual_losses"][i])
             
             logger.log(log_dict)
 
@@ -1017,7 +1162,7 @@ def train_loop(config: TrainConfig):
 
         # Final evaluation
         logger.msg("Final validation...")
-        final_val_loss = run_evaluation(
+        final_val_result = run_evaluation(
             step,
             params,
             precomputed_params,
@@ -1026,7 +1171,14 @@ def train_loop(config: TrainConfig):
             compiled_eval_step,
             config,
         )
-        logger.log({"step": step, "val_loss": final_val_loss})
+        if use_grouped_loss:
+            final_val_loss, final_individual_losses = final_val_result
+            final_log = {"step": step, "val_loss": final_val_loss}
+            for i in range(num_loss_groups):
+                final_log[f"val_loss_group_{i+1}"] = float(final_individual_losses[i])
+            logger.log(final_log)
+        else:
+            logger.log({"step": step, "val_loss": final_val_result})
         logger.msg("Training finished.")
         logger.dump(step, params, opt_state, config)
         logger.finish()
