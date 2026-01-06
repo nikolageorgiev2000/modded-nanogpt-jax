@@ -28,8 +28,8 @@ class DatasetConfig:
     n_interleaved: int = 2  # number of DAGs interleaved together
     branching_factor: int = 2  # branching factor of the tree
     height: int = 5  # tree height (starting from level 1, ending at level `height`)
-    n_data: int = 2**21 * 3  # total number of data samples
-    n_data_batch: int = 2**19  # batch size for data generation
+    n_data: int = 2**19 * 3  # total number of data samples
+    n_data_batch: int = 2**18  # batch size for data generation
     seed: int = 123  # base seed for random generation
 
     @property
@@ -409,8 +409,8 @@ data_cfg = DatasetConfig(
     n_interleaved=2,
     branching_factor=2,
     height=5,
-    n_data=2**21 * 3,
-    n_data_batch=2**19,
+    n_data=2**19 * 3,
+    n_data_batch=2**18,
     seed=123,
 )
 data_cfg.validate()
@@ -450,18 +450,16 @@ for rep in tqdm(range(data_cfg.num_passes)):
     data = np.concatenate([data_cfg.token_arr[-1]*np.ones_like(compacted_with_root_self_loops), compacted_with_root_self_loops], axis=-1)[:,:,1:]
     targets = np.zeros_like(data)
     targets[..., 2] = (data[..., 2] // (data_cfg.n_edges+1)) * (data_cfg.n_edges+1)
-    labels = np.concatenate([np.ones((len(levels), data_cfg.n_interleaved, 2)), levels], axis=1)
+    labels = np.concatenate([np.ones((len(levels), data_cfg.n_interleaved, 2)), levels], axis=1) # concatenate self-loops for the roots
     labels = np.concatenate([np.zeros_like(labels), labels], axis=2)[:,:,1:] # result has last dim like [0, depth, depth]
-    def include_labels(labels, included=np.array([1, 2, 5])):
-        return np.isin(labels, included)
-    mask = include_labels(labels).astype(np.uint16)
+    mask = np.array(labels)
     mask[..., :2] = 0 # only keep child tokens in the loss
+    # print(f"levels: {levels.shape}", f"data: {data.shape}", f"targets: {targets.shape}", f"mask: {mask.shape}")
 
-    data, targets, mask, labels = (
+    data, targets, mask = (
         jnp.array(data, dtype=jnp.uint16),
         jnp.array(targets, dtype=jnp.uint16),
         jnp.array(mask, dtype=jnp.uint16),
-        jnp.array(labels, dtype=jnp.uint16)
     )
     key_d2 = jax.random.PRNGKey(2 + rep)
     key_perms = jax.random.split(key_d2, data_cfg.n_data_batch)
@@ -474,9 +472,9 @@ for rep in tqdm(range(data_cfg.num_passes)):
     targets_from_perms = vmap(lambda i : tok_permutations[i][targets.reshape(data_cfg.n_data_batch, -1)[i]])(jnp.arange(data_cfg.n_data_batch))
     
     data_from_perms_flat, targets_from_perms_flat = data_from_perms.flatten(), targets_from_perms.flatten()
-    mask_flat, labels_flat = mask.flatten(), labels.flatten()
+    mask_flat = mask.flatten()
     data_with_mask_n_targets = jnp.stack([
-        data_from_perms_flat, targets_from_perms_flat, mask_flat #, labels_flat
+        data_from_perms_flat, targets_from_perms_flat, mask_flat
     ], axis=0)
     val_data_len = data_with_mask_n_targets.shape[1] // 16
     assert val_data_len == val_len // data_cfg.num_passes
@@ -540,6 +538,9 @@ config = train.TrainConfig(
     use_pope = True,
     # freeze_params=("wte",),
     max_seq_len = 2*data_cfg.sample_len,
+
+    num_loss_groups = data_cfg.height,
+    loss_combiner = lambda losses: losses[4],
 
     pos_encoding_base = 2*data_cfg.sample_len,
     
