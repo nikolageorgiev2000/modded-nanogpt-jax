@@ -540,7 +540,7 @@ config = train.TrainConfig(
     max_seq_len = 2*data_cfg.sample_len,
 
     num_loss_groups = data_cfg.height,
-    loss_combiner = lambda losses: losses[4],
+    loss_combiner = lambda sums, counts: sums.sum() / counts.sum(),
 
     pos_encoding_base = 2*data_cfg.sample_len,
     

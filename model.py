@@ -475,13 +475,13 @@ def loss_fn(
         num_loss_groups: Maximum mask value for grouped loss computation. If provided along with
                         loss_combiner, enables segment-based loss computation where each mask value
                         (1 to num_loss_groups) represents a separate loss group.
-        loss_combiner: Callable that takes an array of mean losses per group (shape: num_loss_groups,)
+        loss_combiner: Callable that takes (group_sums, group_counts) arrays (each shape: num_loss_groups,)
                       and returns a scalar combined loss for gradient computation.
-                      If None with num_loss_groups, defaults to mean of all group losses.
+                      If None with num_loss_groups, defaults to total_sum / total_count.
     
     Returns:
-        If num_loss_groups is provided: (combined_loss, individual_losses) where individual_losses
-            is shape (num_loss_groups,) containing mean loss for each group.
+        If num_loss_groups is provided: (combined_loss, group_sums, group_counts) where
+            group_sums and group_counts are shape (num_loss_groups,).
         Otherwise: scalar loss value.
     """
     if len(batch) == 3:
@@ -512,31 +512,30 @@ def loss_fn(
         
         # Compute sum of losses per segment (index 0 = ignored positions)
         # num_segments = num_loss_groups + 1 to include segment 0
-        loss_sums = jax.ops.segment_sum(
+        loss_sums_all = jax.ops.segment_sum(
             losses_flat, mask_flat, num_segments=num_loss_groups + 1
         )
         
         # Compute count per segment
-        counts = jax.ops.segment_sum(
+        counts_all = jax.ops.segment_sum(
             jnp.ones_like(losses_flat), mask_flat, num_segments=num_loss_groups + 1
         )
         
-        # Mean loss per segment (avoid division by zero with max(count, 1))
-        # For empty segments, this gives 0/1 = 0 loss
-        mean_losses_all = loss_sums / jnp.maximum(counts, 1.0)
-        
-        # Extract losses for groups 1..num_loss_groups (exclude segment 0 which is ignored)
-        individual_losses = mean_losses_all[1:]  # shape (num_loss_groups,)
+        # Extract sums and counts for groups 1..num_loss_groups (exclude segment 0 which is ignored)
+        group_sums = loss_sums_all[1:]  # shape (num_loss_groups,)
+        group_counts = counts_all[1:]   # shape (num_loss_groups,)
         
         # Combine losses for gradient computation
         if loss_combiner is not None:
-            combined_loss = loss_combiner(individual_losses)
+            # loss_combiner receives (sums, counts) to allow custom weighted combinations
+            combined_loss = loss_combiner(group_sums, group_counts)
         else:
-            # Default: mean of all group losses (only non-empty groups)
-            group_active = counts[1:] > 0
-            combined_loss = jnp.sum(individual_losses * group_active) / jnp.maximum(jnp.sum(group_active), 1.0)
+            # Default: total sum / total count (weighted mean across all groups)
+            total_sum = jnp.sum(group_sums)
+            total_count = jnp.sum(group_counts)
+            combined_loss = total_sum / jnp.maximum(total_count, 1.0)
         
-        return combined_loss, individual_losses
+        return combined_loss, (group_sums, group_counts)
     
     elif mask is not None:
         # Binary mask: sum of masked losses / sum of active mask elements

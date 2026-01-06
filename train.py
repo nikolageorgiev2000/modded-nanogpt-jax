@@ -325,12 +325,13 @@ class TrainConfig:
 
     # Grouped loss computation - for masks with consecutive positive integer values
     # num_loss_groups: max mask value (e.g., 3 means mask values 1, 2, 3 are valid groups)
-    # loss_combiner: callable that takes array of shape (num_loss_groups,) with mean loss per group
+    # loss_combiner: callable that takes (group_sums, group_counts) arrays of shape (num_loss_groups,)
     #                and returns a scalar combined loss for gradient computation.
-    #                If None, defaults to mean of all active group losses.
-    # Example: loss_combiner=lambda losses: losses[0] + 0.5 * losses[1]  # weight different groups
+    #                If None, defaults to total_sum / total_count (weighted mean).
+    # Example: loss_combiner=lambda sums, counts: sums.sum() / counts.sum()  # weighted mean
+    # Example: loss_combiner=lambda sums, counts: (sums / jnp.maximum(counts, 1)).mean()  # mean of means
     num_loss_groups: Optional[int] = None
-    loss_combiner: Optional[Callable[[Any], Any]] = None
+    loss_combiner: Optional[Callable[[Any, Any], Any]] = None
 
     @property
     def data_has_masks(self) -> bool:
@@ -365,17 +366,18 @@ class TrainConfig:
                 f"loss_combiner requires num_loss_groups to be set to a positive value, "
                 f"but num_loss_groups={self.num_loss_groups}"
             )
-            # Validate that loss_combiner can process an array of the expected length
-            dummy_losses = np.ones(self.num_loss_groups, dtype=np.float32)
+            # Validate that loss_combiner can process (sums, counts) arrays of the expected length
+            dummy_sums = np.ones(self.num_loss_groups, dtype=np.float32)
+            dummy_counts = np.ones(self.num_loss_groups, dtype=np.float32)
             try:
-                result = self.loss_combiner(dummy_losses)
+                result = self.loss_combiner(dummy_sums, dummy_counts)
                 # Check result is scalar-like
                 assert np.ndim(result) == 0, (
                     f"loss_combiner must return a scalar, but returned array with shape {np.shape(result)}"
                 )
             except Exception as e:
                 raise AssertionError(
-                    f"loss_combiner failed to process dummy array of length {self.num_loss_groups}: {e}"
+                    f"loss_combiner failed to process dummy (sums, counts) arrays of length {self.num_loss_groups}: {e}"
                 ) from e
         assert self.max_seq_len >= self.block_size, f"max_seq_len must be greater than or equal to block_size, got {self.max_seq_len} and {self.block_size}"
 
@@ -785,13 +787,13 @@ def train_step(
 
     if use_grouped_loss:
         def micro_step(carry, micro_batch):
-            accum_grads, total_loss, total_individual_losses = carry
-            (loss, individual_losses), grads = loss_and_grad_fn(params, micro_batch)
+            accum_grads, total_loss, total_sums, total_counts = carry
+            (loss, (group_sums, group_counts)), grads = loss_and_grad_fn(params, micro_batch)
             new_accum_grads = tree_map(jnp.add, accum_grads, grads)
-            return (new_accum_grads, total_loss + loss, total_individual_losses + individual_losses), None
+            return (new_accum_grads, total_loss + loss, total_sums + group_sums, total_counts + group_counts), None
 
         zero_grads = tree_map(jnp.zeros_like, params)
-        init_carry = (zero_grads, 0.0, jnp.zeros(num_loss_groups, dtype=jnp.float32))
+        init_carry = (zero_grads, 0.0, jnp.zeros(num_loss_groups, dtype=jnp.float32), jnp.zeros(num_loss_groups, dtype=jnp.float32))
     else:
         def micro_step(carry, micro_batch):
             accum_grads, total_loss = carry
@@ -809,10 +811,9 @@ def train_step(
         scan_input = (batched_x, batched_y)
     
     if use_grouped_loss:
-        (final_grads_accum, total_loss, total_individual_losses), _ = scan(
+        (final_grads_accum, total_loss, total_sums, total_counts), _ = scan(
             micro_step, init_carry, scan_input
         )
-        avg_individual_losses = total_individual_losses / n_grad_acc_steps
     else:
         (final_grads_accum, total_loss), _ = scan(
             micro_step, init_carry, scan_input
@@ -836,8 +837,6 @@ def train_step(
     new_params = optax.apply_updates(params, updates)
 
     metrics = {"loss": avg_loss}
-    if use_grouped_loss:
-        metrics["individual_losses"] = avg_individual_losses
 
     return new_params, new_opt_state, metrics
 
@@ -863,45 +862,40 @@ def eval_step(
         batched_mask: Optional mask array of shape (n_grad_acc, batch_size, seq_len).
                       If provided, the loss will be computed only on masked positions.
         num_loss_groups: Maximum mask value for grouped loss computation (static).
-        loss_combiner: Callable to combine individual group losses into a scalar (static).
+        loss_combiner: Callable to combine (group_sums, group_counts) into a scalar (static).
     
     Returns:
-        If num_loss_groups is provided: (avg_loss, avg_individual_losses)
+        If num_loss_groups is provided: (avg_loss, total_sums, total_counts)
         Otherwise: avg_loss (scalar)
     """
     n_grad_acc_steps = batched_x.shape[0]
     use_grouped_loss = num_loss_groups is not None
 
+    # Build scan input tuple: (x, y) or (x, y, mask)
+    if batched_mask is not None:
+        scan_input = (batched_x, batched_y, batched_mask)
+    else:
+        scan_input = (batched_x, batched_y)
+
     if use_grouped_loss:
-        def loss_loop_body(i, carry):
-            accumulated_loss, accumulated_individual_losses = carry
-            if batched_mask is not None:
-                micro_batch = (batched_x[i], batched_y[i], batched_mask[i])
-            else:
-                micro_batch = (batched_x[i], batched_y[i])
-            loss, individual_losses = loss_fn(
+        def micro_step(carry, micro_batch):
+            accumulated_loss, accumulated_sums, accumulated_counts = carry
+            loss, (group_sums, group_counts) = loss_fn(
                 params, micro_batch, model_config, precomputed_params, 
                 training=False, num_loss_groups=num_loss_groups, loss_combiner=loss_combiner
             )
-            return accumulated_loss + loss, accumulated_individual_losses + individual_losses
+            return (accumulated_loss + loss, accumulated_sums + group_sums, accumulated_counts + group_counts), None
 
-        init_carry = (0.0, jnp.zeros(num_loss_groups, dtype=jnp.float32))
-        total_loss, total_individual_losses = jax.lax.fori_loop(
-            0, n_grad_acc_steps, loss_loop_body, init_carry
-        )
+        init_carry = (0.0, jnp.zeros(num_loss_groups, dtype=jnp.float32), jnp.zeros(num_loss_groups, dtype=jnp.float32))
+        (total_loss, total_sums, total_counts), _ = scan(micro_step, init_carry, scan_input)
         avg_loss = total_loss / n_grad_acc_steps
-        avg_individual_losses = total_individual_losses / n_grad_acc_steps
-        return avg_loss, avg_individual_losses
+        return avg_loss, total_sums, total_counts
     else:
-        def loss_loop_body(i, accumulated_loss):
-            if batched_mask is not None:
-                micro_batch = (batched_x[i], batched_y[i], batched_mask[i])
-            else:
-                micro_batch = (batched_x[i], batched_y[i])
+        def micro_step(accumulated_loss, micro_batch):
             loss = loss_fn(params, micro_batch, model_config, precomputed_params, training=False)
-            return accumulated_loss + loss
+            return accumulated_loss + loss, None
 
-        total_loss = jax.lax.fori_loop(0, n_grad_acc_steps, loss_loop_body, 0.0)
+        total_loss, _ = scan(micro_step, 0.0, scan_input)
         avg_loss = total_loss / n_grad_acc_steps
         return avg_loss
 
@@ -914,11 +908,11 @@ def run_evaluation(
     logger,
     compiled_eval_fn: Callable,
     config: TrainConfig,
-) -> Union[float, tuple[float, jax.Array]]:
+) -> Union[float, tuple[float, jax.Array, jax.Array]]:
     """Run validation loop.
     
     Returns:
-        If config.num_loss_groups is set: (final_val_loss, final_individual_losses)
+        If config.num_loss_groups is set: (final_val_loss, total_sums, total_counts)
         Otherwise: final_val_loss (scalar)
     """
     logger.msg(f"Running validation for step {step}...")
@@ -928,7 +922,8 @@ def run_evaluation(
     use_grouped_loss = config.num_loss_groups is not None
     
     if use_grouped_loss:
-        val_individual_losses_accum = jnp.zeros(config.num_loss_groups, dtype=jnp.float32)
+        val_sums_accum = jnp.zeros(config.num_loss_groups, dtype=jnp.float32)
+        val_counts_accum = jnp.zeros(config.num_loss_groups, dtype=jnp.float32)
     
     for batch in val_loader:
         # Call compiled_eval_fn with args matching eval_step signature (minus static args)
@@ -936,8 +931,9 @@ def run_evaluation(
         result = compiled_eval_fn(params, precomputed_params, batch[0], batch[1], batch[2] if has_mask else None)
         
         if use_grouped_loss:
-            loss, individual_losses = result
-            val_individual_losses_accum = val_individual_losses_accum + individual_losses
+            loss, group_sums, group_counts = result
+            val_sums_accum = val_sums_accum + group_sums
+            val_counts_accum = val_counts_accum + group_counts
         else:
             loss = result
         
@@ -951,8 +947,7 @@ def run_evaluation(
     final_val_loss = val_loss_accum / val_steps
     
     if use_grouped_loss:
-        final_individual_losses = val_individual_losses_accum / val_steps
-        return final_val_loss, final_individual_losses
+        return final_val_loss, val_sums_accum, val_counts_accum
     
     return final_val_loss
 
@@ -1122,11 +1117,12 @@ def train_loop(config: TrainConfig):
                     config,
                 )
                 if use_grouped_loss:
-                    val_loss, val_individual_losses = val_result
+                    val_loss, val_sums, val_counts = val_result
                     log_dict["val_loss"] = val_loss
-                    # Log individual validation losses per group
+                    # Log individual validation losses per group (mean = sum / count)
+                    val_means = val_sums / jnp.maximum(val_counts, 1.0)
                     for i in range(num_loss_groups):
-                        log_dict[f"val_loss_group_{i+1}"] = float(val_individual_losses[i])
+                        log_dict[f"val_loss_group_{i+1}"] = float(val_means[i])
                 else:
                     log_dict["val_loss"] = val_result
             
@@ -1149,10 +1145,12 @@ def train_loop(config: TrainConfig):
                     "loss": metrics["loss"],
                 })
                 
-                # Log individual training losses per group
-                if use_grouped_loss and "individual_losses" in metrics:
+                # Log individual training losses per group (mean = sum / count)
+                if use_grouped_loss and "group_sums" in metrics:
+                    train_means = metrics["group_sums"] / jnp.maximum(metrics["group_counts"], 1.0)
                     for i in range(num_loss_groups):
-                        log_dict[f"loss_group_{i+1}"] = float(metrics["individual_losses"][i])
+                        log_dict[f"loss_group_{i+1}"] = float(train_means[i])
+                        log_dict[f"count_group_{i+1}"] = float(metrics["group_counts"][i])
             
             logger.log(log_dict)
 
@@ -1172,10 +1170,11 @@ def train_loop(config: TrainConfig):
             config,
         )
         if use_grouped_loss:
-            final_val_loss, final_individual_losses = final_val_result
+            final_val_loss, final_sums, final_counts = final_val_result
             final_log = {"step": step, "val_loss": final_val_loss}
+            final_means = final_sums / jnp.maximum(final_counts, 1.0)
             for i in range(num_loss_groups):
-                final_log[f"val_loss_group_{i+1}"] = float(final_individual_losses[i])
+                final_log[f"val_loss_group_{i+1}"] = float(final_means[i])
             logger.log(final_log)
         else:
             logger.log({"step": step, "val_loss": final_val_result})
