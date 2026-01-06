@@ -355,17 +355,17 @@ def compact_nodes_many(interleaved_edges: np.ndarray):
 
 
 dataset_name = 'backtracktask'
-n_edges = 14
+n_edges = 30
 n_interleaved = 2
-branching_factor = 10
+branching_factor = 2
 height = 5  # starting from level 1, ending at level `height`
 assert balanced_tree_nnodes(branching_factor, height) >= n_edges+1 # if the balanced tree is too small, we can't have that many edges
 adj_list_len = 3*(n_edges+1) # 3 tok per edge pair, additional 1 tok for root self-loops
 sample_len = adj_list_len * n_interleaved
 token_arr = np.arange((n_edges+1)*n_interleaved + 1, dtype=np.uint16) # +1 for the separator
-n_nodes = balanced_tree_nnodes(branching_factor, height)
-n_data = 2**20*3
-n_data_batch = 2**18
+n_nodes = balanced_tree_nnodes(branching_factor, height) # number of nodes in the un-sampled tree
+n_data = 2**21*3
+n_data_batch = 2**19
 
 
 print(f"Token count: {token_arr.shape}")
@@ -407,10 +407,12 @@ for rep in tqdm(range(num_passes)):
     data = np.concatenate([token_arr[-1]*np.ones_like(compacted_with_root_self_loops), compacted_with_root_self_loops], axis=-1)[:,:,1:]
     targets = np.zeros_like(data)
     targets[..., 2::3] = (data[..., 2::3] // (n_edges+1)) * (n_edges+1)
-    mask = np.zeros_like(data)
-    mask[:, ::, 2] = 1
     labels = np.concatenate([np.ones((len(levels), n_interleaved, 2)), levels], axis=1)
-    labels = np.concatenate([np.zeros_like(labels), labels], axis=2)[:,:,1:]
+    labels = np.concatenate([np.zeros_like(labels), labels], axis=2)[:,:,1:] # result has last dim like [0, depth, depth]
+    def include_labels(labels, included=np.array([1, 4, 5])):
+        return np.isin(labels, included)
+    mask = include_labels(labels).astype(np.uint16)
+    mask[..., :2] = 0 # only keep child tokens in the loss
 
     data, targets, mask, labels = (
         jnp.array(data, dtype=jnp.uint16),
@@ -460,13 +462,15 @@ i = 0
 G = nx.DiGraph()
 G.add_edges_from(list(map(tuple, extract_interleaved_edges(val_ids[0], i).reshape(-1, 3)[:, 1:].tolist())))
 pos = dag_pos_dot(G)
+plt.figure(figsize=(8, 6))
 nx.draw(
     G, pos=pos,
     with_labels=True, node_size=120,
     node_color="lightblue", edge_color="gray",
     width=0.8, arrows=True, arrowsize=10
 )
-plt.show()
+plt.savefig(f"{dataset_name}/example_input.png", bbox_inches="tight")
+plt.close()
 
 
 
@@ -477,11 +481,11 @@ config = train.TrainConfig(
     head_dim = 256,
     n_layer = 5,
     block_size = sample_len, # should match the task sequence length so tasks are independently trained on
-    batch_size = 64,
+    batch_size = 256,
     gradient_accumulation_steps = 1,
     max_iters = 100_000,
     eval_iters = 25, # val_data_len // 64, # number of examples // batch_size
-    learning_rate = 1e-3,
+    learning_rate = 6e-4,
     min_lr = 0,
     warmup_iters = 5_000,
     lr_decay_iters = 100_000,
@@ -522,16 +526,16 @@ print(params)
 
 rope_params = model.precompute_pope(config.get_model_config(), None) if config.use_pope else model.precompute_rope(config.get_model_config(), None)
 
-error_count = 0
-for i in tqdm(range(1_000)):
+error_pct = jnp.empty(100)
+for i in tqdm(range(len(error_pct))):
     test_input_ids = extract_interleaved_edges(val_ids[0], i)
     test_target_ids = extract_interleaved_edges(val_ids[1], i)
     test_mask_ids = extract_interleaved_edges(val_ids[2], i)
     res = model.gpt_forward(params, rope_params, test_input_ids[None,:], config.get_model_config())[0].argmax(axis=-1)
 
-    diff = np.setdiff1d(test_target_ids * test_mask_ids, res * test_mask_ids)
-    error_count += len(diff)
-print(f"Error count: {error_count}")
+    diff = jnp.count_nonzero(test_mask_ids * (test_target_ids - res))
+    error_pct = error_pct.at[i].set(diff / test_mask_ids.sum())
+print(f"Error count: {error_pct.mean()}")
 
 
 i = 0

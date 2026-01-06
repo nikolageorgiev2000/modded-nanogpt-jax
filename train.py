@@ -995,8 +995,8 @@ def train_loop(config: TrainConfig):
                 params,
                 precomputed_params,
                 opt_state,
-                *batch[:2],
-                *batch[2:],
+                batch[0], batch[1], # x, y
+                batch[2] if has_mask else None, # mask
                 freeze_mask,
             )
 
