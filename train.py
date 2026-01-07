@@ -152,11 +152,6 @@ class Logger:
         if not self.is_master:
             return
         print(msg)
-        if self.use_wandb:
-            try:
-                wandb.termlog(str(msg))
-            except Exception:
-                pass
         with open(self.logfile, "a") as f:
             f.write(f"[MESSAGE] {msg}\n")
 
@@ -279,6 +274,7 @@ class TrainConfig:
     eval_iters: int = 8  # number of batches for evaluation (if it exceeds the dataset size, it will cycle through the dataset)
     log_interval: int = 10  # log every N steps
     save_every: int = 0  # save checkpoint every N steps (0 = disabled)
+    early_stop_threshold: float = 1e-4  # stop training if val_loss < threshold (0 = disabled)
 
     # Batch sizes (aligned with nanoGPT, but adjusted for 16-device mesh)
     batch_size: int = 64  # micro batch size (must be divisible by num devices for this sharding)
@@ -1124,7 +1120,14 @@ def train_loop(config: TrainConfig):
                     for i in range(num_loss_groups):
                         log_dict[f"val_loss_group_{i+1}"] = float(val_means[i])
                 else:
-                    log_dict["val_loss"] = val_result
+                    val_loss = val_result
+                    log_dict["val_loss"] = val_loss
+                
+                # Early stopping check
+                if config.early_stop_threshold > 0 and float(val_loss) < config.early_stop_threshold:
+                    logger.msg(f"Early stopping: val_loss {float(val_loss):.6g} < threshold {config.early_stop_threshold:.6g}")
+                    logger.log(log_dict)
+                    break
             
             # Training: compiled_train_step(params, precomputed, opt_state, x, y, [mask], freeze_mask)
             params, opt_state, metrics = compiled_train_step(
@@ -1179,7 +1182,6 @@ def train_loop(config: TrainConfig):
         else:
             logger.log({"step": step, "val_loss": final_val_result})
         logger.msg("Training finished.")
-        logger.dump(step, params, opt_state, config)
         logger.finish()
     return params
 

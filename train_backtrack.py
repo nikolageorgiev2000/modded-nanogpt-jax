@@ -6,31 +6,55 @@ import numpy as np
 import numba as nb
 from jax import vmap
 from dataclasses import dataclass
+from enum import Enum
 
 import matplotlib
 from matplotlib import pyplot as plt
 import os
+import argparse
 
 import networkx as nx
 from networkx.drawing.nx_pydot import graphviz_layout
 from tqdm import tqdm
 
+import wandb
 
 import model
 import train
 
 
+class SupervisionDegree(Enum):
+    """Degree of supervision for training."""
+    FULL = "full"           # Supervise all nodes
+    INTERMEDIATE = "intermediate"  # Supervise intermediate nodes only
+    LEAF = "leaf"           # Supervise leaf nodes only
+
+
+# Sweep configuration
+SWEEP_CONFIG = {
+    "method": "grid",
+    "name": "backtrack-sweep",
+    "metric": {"name": "val_loss", "goal": "minimize"},
+    "parameters": {
+        "n_layer": {"values": [2, 4, 6]},
+        "embd_dim": {"values": [512, 1024]},
+        "supervision_degree": {"values": ["full", "intermediate", "leaf"]},
+        "batch_size": {"values": [64, 256]},
+    },
+}
+
+
 @dataclass
 class DatasetConfig:
     """Configuration for backtrack task dataset generation."""
-    dataset_name: str = 'backtracktask'
-    n_edges: int = 30  # number of edges per DAG
-    n_interleaved: int = 2  # number of DAGs interleaved together
-    branching_factor: int = 2  # branching factor of the tree
-    height: int = 5  # tree height (starting from level 1, ending at level `height`)
-    n_data: int = 2**19 * 3  # total number of data samples
-    n_data_batch: int = 2**18  # batch size for data generation
-    seed: int = 123  # base seed for random generation
+    dataset_name: str  # name for the dataset folder
+    n_edges: int       # number of edges per DAG
+    n_interleaved: int # number of DAGs interleaved together
+    branching_factor: int  # branching factor of the tree
+    height: int        # tree height (starting from level 1, ending at level `height`)
+    n_data: int        # total number of data samples
+    n_data_batch: int  # batch size for data generation
+    seed: int          # base seed for random generation
 
     @property
     def n_nodes(self) -> int:
@@ -405,10 +429,10 @@ def compact_nodes_many(interleaved_edges: np.ndarray):
 # Create dataset configuration
 data_cfg = DatasetConfig(
     dataset_name='backtracktask',
-    n_edges=30,
+    n_edges=62,
     n_interleaved=2,
     branching_factor=2,
-    height=5,
+    height=9,
     n_data=2**19 * 3,
     n_data_batch=2**18,
     seed=123,
@@ -515,105 +539,278 @@ plt.close()
 
 
 
-config = train.TrainConfig(
-    input_bin=f"{data_cfg.dataset_name}/train_with_mask_n_targets.bin",
-    input_val_bin=f"{data_cfg.dataset_name}/val_with_mask_n_targets.bin",
-    embd_dim = 512,
-    head_dim = 256,
-    n_layer = 5,
-    block_size = data_cfg.sample_len, # should match the task sequence length so tasks are independently trained on
-    batch_size = 256,
-    gradient_accumulation_steps = 1,
-    max_iters = 100_000,
-    eval_iters = 25, # val_data_len // 64, # number of examples // batch_size
-    learning_rate = 6e-4,
-    min_lr = 0,
-    warmup_iters = 5_000,
-    lr_decay_iters = 100_000,
-    vocab_size = len(data_cfg.token_arr),
-    use_masked_loss = True,
-    use_custom_target=True,
-    use_mlp = False,
-    off_by_one_attn = False,
-    use_pope = True,
-    # freeze_params=("wte",),
-    max_seq_len = 2*data_cfg.sample_len,
-
-    num_loss_groups = data_cfg.height,
-    loss_combiner = lambda sums, counts: sums.sum() / counts.sum(),
-
-    pos_encoding_base = 2*data_cfg.sample_len,
+def create_train_config(
+    data_cfg: DatasetConfig,
+    n_layer: int = 4,
+    embd_dim: int = 512,
+    batch_size: int = 256,
+    supervision_degree: SupervisionDegree = SupervisionDegree.FULL,
+    wandb_mode: str = "online",
+    wandb_project: str = "backtrack-sweep",
+    wandb_group: str = None,
+) -> train.TrainConfig:
+    """Create a TrainConfig with the given hyperparameters."""
+    # head_dim scales with embd_dim (half of embd_dim)
+    if supervision_degree == SupervisionDegree.FULL:
+        level_selection = jnp.arange(data_cfg.height)
+    elif supervision_degree == SupervisionDegree.INTERMEDIATE:
+        level_selection = jnp.arange(data_cfg.height, step=2)
+    elif supervision_degree == SupervisionDegree.LEAF:
+        level_selection = jnp.array([data_cfg.height - 1])
     
-    log_interval = 10_000,
-    eval_interval = 1_000,
+    loss_combiner = lambda sums, counts: (sums[level_selection] / jnp.maximum(counts[level_selection], 1)).mean()
+    
+    return train.TrainConfig(
+        input_bin=f"{data_cfg.dataset_name}/train_with_mask_n_targets.bin",
+        input_val_bin=f"{data_cfg.dataset_name}/val_with_mask_n_targets.bin",
+        embd_dim=embd_dim,
+        head_dim=256,
+        n_layer=n_layer,
+        block_size=data_cfg.sample_len,
+        batch_size=batch_size,
+        gradient_accumulation_steps=1,
+        max_iters=50_000,
+        eval_iters=25,
+        learning_rate=1e-3,
+        min_lr=0,
+        warmup_iters=5_000,
+        lr_decay_iters=50_000,
+        vocab_size=len(data_cfg.token_arr),
+        use_masked_loss=True,
+        use_custom_target=True,
+        use_mlp=False,
+        off_by_one_attn=False,
+        use_pope=True,
+        max_seq_len=2 * data_cfg.sample_len,
+        num_loss_groups=data_cfg.height,
+        loss_combiner=loss_combiner,
+        pos_encoding_base=2 * data_cfg.sample_len,
+        log_interval=10_000,
+        eval_interval=1_000,
+        wandb_mode=wandb_mode,
+        wandb_project=wandb_project,
+        wandb_group=wandb_group,
+    )
 
-    # seed = 15,
-)
 
-params = train.train_loop(config)
+def generate_attention_figure(params, config, data_cfg, val_ids, sample_idx: int = 0):
+    """Generate attention weights visualization figure."""
+    rope_params = (
+        model.precompute_pope(config.get_model_config(), None) 
+        if config.use_pope 
+        else model.precompute_rope(config.get_model_config(), None)
+    )
+    
+    test_input_ids = extract_interleaved_edges(val_ids[0], sample_idx)
+    
+    _, attn_weights = model.gpt_forward(
+        params, rope_params, test_input_ids[None, :], 
+        config.get_model_config(), return_attn_weights=True
+    )
+    
+    query_subset = jnp.arange(2, data_cfg.sample_len, 3)
+    key_subset = jnp.concatenate([
+        jnp.arange(1, data_cfg.sample_len, 3)[None, :], 
+        jnp.arange(2, data_cfg.sample_len, 3)[None, :]
+    ]).T.flatten()
+    
+    num_layers = len(attn_weights)
+    num_heads = attn_weights[0][0].shape[0]
+    
+    fig, axes = plt.subplots(num_layers, num_heads, figsize=(6 * num_heads, 6 * num_layers), squeeze=False)
+    
+    for l in range(num_layers):
+        for h in range(num_heads):
+            selected_attn = attn_weights[l][0][h][query_subset[:, None], key_subset[None, :]].astype(np.float32)
+            ax = axes[l, h]
+            im = heatmap(
+                selected_attn,
+                test_input_ids[query_subset], test_input_ids[key_subset], ax=ax,
+                cmap="YlGnBu"
+            )
+            ax.set_title(f"Layer {l}, Head {h}")
+    
+    fig.tight_layout()
+    return fig
 
-print("FINISHED TRAINING")
-print("Saving config and params")
-# save config and params using numpy
-np.savez(f"{data_cfg.dataset_name}/config.npz", config=config)
-np.savez(f"{data_cfg.dataset_name}/params.npz", params=params)
+
+def save_and_log_attention_figure(params, config, data_cfg, val_ids, run_name: str = None):
+    """Generate attention figure, save to PNG, and log to wandb."""
+    fig = generate_attention_figure(params, config, data_cfg, val_ids)
+    
+    # Create unique filename with run name if provided
+    if run_name:
+        save_path = f"{data_cfg.dataset_name}/attention_weights_{run_name}.png"
+    else:
+        save_path = f"{data_cfg.dataset_name}/attention_weights.png"
+    
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"Saved attention weights figure to {save_path}")
+    
+    # Log to wandb
+    wandb.log({"attention_weights": wandb.Image(save_path)})
+    print("Logged attention weights to wandb")
+    
+    plt.close(fig)
+    return save_path
 
 
+def run_sweep_train():
+    """Training function called by wandb sweep agent."""
+    # Initialize wandb run (sweep agent will have already set up the config)
+    run = wandb.init()
+    
+    # Get hyperparameters from wandb config
+    sweep_n_layer = wandb.config.n_layer
+    sweep_embd_dim = wandb.config.embd_dim
+    sweep_supervision_degree = SupervisionDegree(wandb.config.supervision_degree)
+    sweep_batch_size = wandb.config.batch_size
+    
+    print(f"Starting sweep run with: n_layer={sweep_n_layer}, embd_dim={sweep_embd_dim}, "
+          f"supervision={sweep_supervision_degree.value}, batch_size={sweep_batch_size}")
+    
+    config = create_train_config(
+        data_cfg=data_cfg,
+        n_layer=sweep_n_layer,
+        embd_dim=sweep_embd_dim,
+        batch_size=sweep_batch_size,
+        supervision_degree=sweep_supervision_degree,
+        wandb_mode="disabled",  # Sweep handles wandb, don't double-init
+    )
+    
+    params = train.train_loop(config)
+    
+    print("FINISHED TRAINING")
+    
+    # Log attention weights figure to wandb
+    run_name = f"L{sweep_n_layer}_E{sweep_embd_dim}_B{sweep_batch_size}_{sweep_supervision_degree.value}"
+    save_and_log_attention_figure(params, config, data_cfg, val_ids, run_name=run_name)
+    
+    run.finish()
+    return params
 
-# load config and params using numpy
-config = np.load(f"{data_cfg.dataset_name}/config.npz", allow_pickle=True)["config"].item()
-params = np.load(f"{data_cfg.dataset_name}/params.npz", allow_pickle=True)["params"].item()
 
-print(config)
-print(params)
+def run_single_train(
+    n_layer: int = 4,
+    embd_dim: int = 512,
+    batch_size: int = 256,
+    supervision_degree: SupervisionDegree = SupervisionDegree.FULL,
+):
+    """Run a single training run without sweep."""
+    config = create_train_config(
+        data_cfg=data_cfg,
+        n_layer=n_layer,
+        embd_dim=embd_dim,
+        batch_size=batch_size,
+        supervision_degree=supervision_degree,
+        wandb_mode="online",
+        wandb_project="backtrack-single",
+    )
+    
+    params = train.train_loop(config)
+    print("FINISHED TRAINING")
+    return params
 
 
-rope_params = model.precompute_pope(config.get_model_config(), None) if config.use_pope else model.precompute_rope(config.get_model_config(), None)
+def create_sweep(project: str = "backtrack-sweep") -> str:
+    """Create a wandb sweep and return the sweep ID."""
+    sweep_id = wandb.sweep(SWEEP_CONFIG, project=project)
+    print(f"Created sweep with ID: {sweep_id}")
+    return sweep_id
 
-error_pct = jnp.empty(100)
-for i in tqdm(range(len(error_pct))):
+
+def run_sweep_agent(sweep_id: str, project: str = "backtrack-sweep", count: int = None):
+    """Run a wandb sweep agent."""
+    wandb.agent(sweep_id, function=run_sweep_train, project=project, count=count)
+
+
+# Parse command line arguments
+parser = argparse.ArgumentParser(description="Backtrack task training with wandb sweep support")
+parser.add_argument("--mode", type=str, default="single", choices=["single", "create_sweep", "agent"],
+                    help="Mode: 'single' for single run, 'create_sweep' to create a sweep, 'agent' to run as sweep agent")
+parser.add_argument("--sweep_id", type=str, default=None, help="Sweep ID for agent mode")
+parser.add_argument("--project", type=str, default="backtrack-sweep", help="Wandb project name")
+parser.add_argument("--count", type=int, default=None, help="Number of runs for sweep agent (None for unlimited)")
+parser.add_argument("--n_layer", type=int, default=4, help="Number of layers (for single mode)")
+parser.add_argument("--embd_dim", type=int, default=512, help="Embedding dimension (for single mode)")
+parser.add_argument("--batch_size", type=int, default=256, help="Batch size (for single mode)")
+parser.add_argument("--supervision", type=str, default="full", choices=["full", "intermediate", "leaf"],
+                    help="Supervision degree (for single mode)")
+
+args = parser.parse_args()
+
+if args.mode == "single":
+    # Create config for evaluation
+    config = create_train_config(
+        data_cfg=data_cfg,
+        n_layer=args.n_layer,
+        embd_dim=args.embd_dim,
+        batch_size=args.batch_size,
+        supervision_degree=SupervisionDegree(args.supervision),
+        wandb_mode="disabled",
+    )
+    
+    params = run_single_train(
+        n_layer=args.n_layer,
+        embd_dim=args.embd_dim,
+        batch_size=args.batch_size,
+        supervision_degree=SupervisionDegree(args.supervision),
+    )
+    
+    # Evaluation code (only runs in single mode)
+    rope_params = model.precompute_pope(config.get_model_config(), None) if config.use_pope else model.precompute_rope(config.get_model_config(), None)
+
+    error_pct = jnp.empty(100)
+    for i in tqdm(range(len(error_pct))):
+        test_input_ids = extract_interleaved_edges(val_ids[0], i)
+        test_target_ids = extract_interleaved_edges(val_ids[1], i)
+        test_mask_ids = extract_interleaved_edges(val_ids[2], i)
+        res = model.gpt_forward(params, rope_params, test_input_ids[None,:], config.get_model_config())[0].argmax(axis=-1)
+
+        diff = jnp.count_nonzero(test_mask_ids * (test_target_ids - res))
+        error_pct = error_pct.at[i].set(diff / test_mask_ids.sum())
+    print(f"Error count: {error_pct.mean()}")
+
+    i = 0
     test_input_ids = extract_interleaved_edges(val_ids[0], i)
     test_target_ids = extract_interleaved_edges(val_ids[1], i)
     test_mask_ids = extract_interleaved_edges(val_ids[2], i)
-    res = model.gpt_forward(params, rope_params, test_input_ids[None,:], config.get_model_config())[0].argmax(axis=-1)
+    test_input_ids * test_mask_ids, res * test_mask_ids
 
-    diff = jnp.count_nonzero(test_mask_ids * (test_target_ids - res))
-    error_pct = error_pct.at[i].set(diff / test_mask_ids.sum())
-print(f"Error count: {error_pct.mean()}")
+    preds, attn_weights = model.gpt_forward(params, rope_params, test_input_ids[None,:], config.get_model_config(), return_attn_weights=True)
+    res = preds[0].argmax(axis=-1)
 
+    query_subset = jnp.arange(2, data_cfg.sample_len, 3)
+    key_subset = jnp.concatenate([jnp.arange(1, data_cfg.sample_len, 3)[None, :], jnp.arange(2, data_cfg.sample_len, 3)[None, :]]).T.flatten()
 
-i = 0
-test_input_ids = extract_interleaved_edges(val_ids[0], i)
-test_target_ids = extract_interleaved_edges(val_ids[1], i)
-test_mask_ids = extract_interleaved_edges(val_ids[2], i)
-test_input_ids * test_mask_ids, res * test_mask_ids
+    # Determine num_layers and num_heads from attn_weights structure
+    num_layers = len(attn_weights)
+    num_heads = attn_weights[0][0].shape[0]  # Assuming shape: [num_heads, seq, seq]
 
+    fig, axes = plt.subplots(num_layers, num_heads, figsize=(6 * num_heads, 6 * num_layers), squeeze=False)
 
-preds, attn_weights = model.gpt_forward(params, rope_params, test_input_ids[None,:], config.get_model_config(), return_attn_weights=True)
-res = preds[0].argmax(axis=-1)
+    for l in range(num_layers):
+        for h in range(num_heads):
+            # sum over all heads because we only need two heads in the first layer
+            # remaining layers are splitting the single head into two (seems arbitrary)
+            selected_attn = attn_weights[l][0][h][query_subset[:, None], key_subset[None, :]].astype(np.float32)
+            ax = axes[l, h]
+            im = heatmap(
+                selected_attn,
+                test_input_ids[query_subset], test_input_ids[key_subset], ax=ax,
+                cmap="YlGnBu"
+            )
+            ax.set_title(f"Layer {l}, Head {h}")
 
+    fig.tight_layout()
+    plt.show()
 
-query_subset = jnp.arange(2, data_cfg.sample_len, 3)
-key_subset = jnp.concatenate([jnp.arange(1, data_cfg.sample_len, 3)[None, :], jnp.arange(2, data_cfg.sample_len, 3)[None, :]]).T.flatten()
+elif args.mode == "create_sweep":
+    sweep_id = create_sweep(project=args.project)
+    print(f"\nTo run agents, use:\n  python train_backtrack.py --mode agent --sweep_id {sweep_id} --project {args.project}")
 
-# Determine num_layers and num_heads from attn_weights structure
-num_layers = len(attn_weights)
-num_heads = attn_weights[0][0].shape[0]  # Assuming shape: [num_heads, seq, seq]
-
-fig, axes = plt.subplots(num_layers, num_heads, figsize=(6 * num_heads, 6 * num_layers), squeeze=False)
-
-for l in range(num_layers):
-    for h in range(num_heads):
-        # sum over all heads because we only need two heads in the first layer
-        # remaining layers are splitting the single head into two (seems arbitrary)
-        selected_attn = attn_weights[l][0][h][query_subset[:, None], key_subset[None, :]].astype(np.float32)
-        ax = axes[l, h]
-        im = heatmap(
-            selected_attn,
-            test_input_ids[query_subset], test_input_ids[key_subset], ax=ax,
-            cmap="YlGnBu"
-        )
-        ax.set_title(f"Layer {l}, Head {h}")
-
-fig.tight_layout()
-plt.show()
+elif args.mode == "agent":
+    if args.sweep_id is None:
+        print("Error: --sweep_id is required for agent mode")
+        exit(1)
+    run_sweep_agent(sweep_id=args.sweep_id, project=args.project, count=args.count)
