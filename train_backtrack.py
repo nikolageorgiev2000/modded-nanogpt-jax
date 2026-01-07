@@ -256,7 +256,8 @@ def sample_one_edges_into(r: int, h: int, n_edges: int,
                           node_offset: int, state: np.uint32,
                           out_edges: np.ndarray) -> np.uint32:
     """
-    Writes (n_edges, 2) into out_edges using heap/BFS r-ary indexing.
+    Writes (n_edges+1, 2) into out_edges using heap/BFS r-ary indexing.
+    The first edge is a root self-loop (0 -> 0), followed by n_edges tree edges.
     Node labels are offset by node_offset to avoid collisions between graphs.
     Assumes n_edges <= n_nodes-1 (otherwise you can't have that many tree edges).
     """
@@ -264,11 +265,15 @@ def sample_one_edges_into(r: int, h: int, n_edges: int,
     frontier = np.empty(n_nodes, dtype=np.int32)
     next_child = np.zeros(n_nodes, dtype=np.int16)
 
+    # Write root self-loop as the first edge
+    out_edges[0, 0] = 0 + node_offset
+    out_edges[0, 1] = 0 + node_offset
+
     frontier[0] = 0
     frontier_size = 1
-    m = 0
+    m = 1  # Start at position 1 since position 0 has the self-loop
 
-    while m < n_edges and frontier_size > 0:
+    while m < n_edges + 1 and frontier_size > 0:
         state, idx = rand_below(state, frontier_size)
         u = frontier[idx]
 
@@ -308,17 +313,19 @@ def sample_interleaved_edges_many(r: int, h: int, n_edges: int, k: int,
     """
     r: branching factor
     h: height (starts at 1)
-    n_edges: number of edges per list
+    n_edges: number of tree edges per list (each list also gets a root self-loop)
     k: number of lists
     n_out: number of output samples
     seed0: seed
 
-    Returns: out shape (n_out, k*n_edges, 2) int32
+    Returns: out shape (n_out, k*(n_edges+1), 2) int32
     Each output is a uniform random interleaving of k DAG edge lists,
     preserving within-list order, with disjoint node IDs via offsets.
+    Each list has n_edges+1 edges: 1 root self-loop + n_edges tree edges.
     """
     n_nodes = balanced_tree_nnodes(r, h)
-    out = np.empty((n_out, k * n_edges, 2), dtype=np.int32)
+    edges_per_list = n_edges + 1  # includes root self-loop
+    out = np.empty((n_out, k * edges_per_list, 2), dtype=np.int32)
 
     for g in nb.prange(n_out):
         # independent RNG stream per output
@@ -327,21 +334,21 @@ def sample_interleaved_edges_many(r: int, h: int, n_edges: int, k: int,
                  ^ np.uint32(g * 747796405))
 
         # Generate k lists of edges (local buffer)
-        lists = np.empty((k, n_edges, 2), dtype=np.int32)
+        lists = np.empty((k, edges_per_list, 2), dtype=np.int32)
         for t in range(k):
             offset = t * n_nodes
             state = sample_one_edges_into(r, h, n_edges, offset, state, lists[t])
 
         # Interleave them uniformly:
-        # remaining counts r[i] start at n_edges
+        # remaining counts r[i] start at edges_per_list
         rem = np.empty(k, dtype=np.int32)
         pos = np.zeros(k, dtype=np.int32)
         for i in range(k):
-            rem[i] = n_edges
+            rem[i] = edges_per_list
 
-        remaining_total = k * n_edges
+        remaining_total = k * edges_per_list
 
-        for m in range(k * n_edges):
+        for m in range(k * edges_per_list):
             # draw u in [0, remaining_total)
             state, u = rand_below(state, remaining_total)
 
@@ -479,14 +486,10 @@ def generate_dataset(data_cfg: DatasetConfig) -> np.ndarray:
         edges = sample_interleaved_edges_many(data_cfg.branching_factor, data_cfg.height, data_cfg.n_edges, data_cfg.n_interleaved, data_cfg.n_data_batch, seed0=data_cfg.seed+rep)
         levels = np.ceil(np.log((((edges % data_cfg.n_nodes)+1) * (data_cfg.branching_factor - 1))+1) / np.log(data_cfg.branching_factor))
         compacted = compact_nodes_many(edges)
-        roots_tiled = np.tile(np.arange(data_cfg.n_interleaved)*(data_cfg.n_edges+1), (data_cfg.n_data_batch, 1))
-        root_self_loops = np.repeat(roots_tiled, 2, axis=-1).reshape(compacted.shape[0], data_cfg.n_interleaved, 2)
-        compacted_with_root_self_loops = np.concatenate([root_self_loops, compacted], axis=-2)
-        data = np.concatenate([data_cfg.token_arr[-1]*np.ones_like(compacted_with_root_self_loops), compacted_with_root_self_loops], axis=-1)[:,:,1:]
+        data = np.concatenate([data_cfg.token_arr[-1]*np.ones_like(compacted), compacted], axis=-1)[:,:,1:]
         targets = np.zeros_like(data)
         targets[..., 2] = (data[..., 2] // (data_cfg.n_edges+1)) * (data_cfg.n_edges+1)
-        labels = np.concatenate([np.ones((len(levels), data_cfg.n_interleaved, 2)), levels], axis=1)
-        labels = np.concatenate([np.zeros_like(labels), labels], axis=2)[:,:,1:]
+        labels = np.concatenate([np.zeros_like(levels), levels], axis=2)[:,:,1:]
         mask = np.array(labels)
         mask[..., :2] = 0
 
@@ -588,12 +591,12 @@ def create_train_config(
         block_size=data_cfg.sample_len,
         batch_size=batch_size,
         gradient_accumulation_steps=1,
-        max_iters=50_000,
+        max_iters=100_000,
         eval_iters=25,
         learning_rate=1e-3,
         min_lr=0,
-        warmup_iters=5_000,
-        lr_decay_iters=50_000,
+        warmup_iters=10_000,
+        lr_decay_iters=100_000,
         vocab_size=len(data_cfg.token_arr),
         use_masked_loss=True,
         use_custom_target=True,
