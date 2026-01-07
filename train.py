@@ -88,49 +88,23 @@ except Exception:  # pragma: no cover
 
 
 class Logger:
-    """Unified logger that handles both local printing and optional W&B logging."""
+    """Unified logger that handles local printing and logs to existing W&B runs."""
 
     def __init__(self, config):
         self.is_master = jax.process_index() == 0
-        self.use_wandb = config.wandb_mode != "disabled" and self.is_master
         self.logfile: Optional[str] = None
         self.logdir: Optional[str] = None
         self.run_id: Optional[str] = None
-        self._wandb_run: Optional[Any] = None
+        
+        # Use wandb if a run already exists (e.g., from sweep agent)
+        self.use_wandb = self.is_master and wandb is not None and wandb.run is not None
 
         if not self.is_master:
             return
 
         if self.use_wandb:
-            if wandb is None:
-                print("[wandb] wandb not installed. Disabling W&B.")
-                self.use_wandb = False
-            else:
-                mode = config.wandb_mode
-                has_env_key = bool(os.getenv("WANDB_API_KEY"))
-                has_netrc = os.path.exists(os.path.expanduser("~/.netrc"))
-                if mode == "online" and not (has_env_key or has_netrc):
-                    print("[wandb] No credentials found. Falling back to offline mode.")
-                    mode = "offline"
-
-                try:
-                    self._wandb_run = wandb.init(
-                        project=config.wandb_project,
-                        entity=config.wandb_entity,
-                        name=config.wandb_run_name,
-                        group=config.wandb_group,
-                        job_type=config.wandb_job_type,
-                        notes=config.wandb_notes,
-                        tags=list(config.wandb_tags),
-                        mode=mode,
-                        config=dataclasses.asdict(config),
-                    )
-                    self.run_id = getattr(self._wandb_run, "id", None) or str(uuid.uuid4())
-                except Exception as e:
-                    print(f"[wandb] init failed ({type(e).__name__}: {e}). Disabling W&B.")
-                    self.use_wandb = False
-
-        if self.run_id is None:
+            self.run_id = getattr(wandb.run, "id", None) or str(uuid.uuid4())
+        else:
             self.run_id = str(uuid.uuid4())
 
         self.logdir = f"logs/{self.run_id}/"
@@ -141,12 +115,6 @@ class Logger:
         with open(self.logfile, "w") as f:
             with open(sys.argv[0]) as f2:
                 f.write("=" * 100 + "\n" + f2.read() + "\n" + "=" * 100 + "\n")
-
-        if self.use_wandb and getattr(config, "wandb_log_code", True):
-            try:
-                wandb.run.log_code(".", include_fn=lambda p: p.endswith(".py"))
-            except Exception:
-                pass
 
     def msg(self, msg: str):
         if not self.is_master:
@@ -212,11 +180,7 @@ class Logger:
         pass  # Simplified Logger logs immediately now
 
     def finish(self):
-        if self.use_wandb:
-            try:
-                wandb.finish()
-            except Exception:
-                pass
+        pass  # Wandb run is managed externally (e.g., by sweep context manager)
 
 
 # ====================== training config =========================

@@ -439,105 +439,127 @@ data_cfg = DatasetConfig(
 )
 data_cfg.validate()
 
-print(f"Token count: {data_cfg.token_arr.shape}")
 
-if not os.path.exists(data_cfg.dataset_name):
-    os.makedirs(data_cfg.dataset_name)
+def dataset_exists(data_cfg: DatasetConfig) -> bool:
+    """Check if the dataset files already exist."""
+    train_path = os.path.join(data_cfg.dataset_name, 'train_with_mask_n_targets.bin')
+    val_path = os.path.join(data_cfg.dataset_name, 'val_with_mask_n_targets.bin')
+    return os.path.exists(train_path) and os.path.exists(val_path)
 
-def make_memmap(path, shape, dtype):
-    print(f"Creating memmap for {path} with shape {shape} and dtype {dtype}")
-    return np.memmap(path, mode='w+', dtype=dtype, shape=shape)
 
-total_len = data_cfg.n_data * data_cfg.sample_len
-n_rows = 3
-val_len = total_len // 16
+def generate_dataset(data_cfg: DatasetConfig) -> np.ndarray:
+    """Generate the dataset and return the final val_ids for visualization."""
+    print(f"Token count: {data_cfg.token_arr.shape}")
 
-# Total shapes for memmaps (we'll simply append pass-by-pass)
-train_shape = (n_rows, total_len - val_len)
-val_shape   = (n_rows, val_len)
+    if not os.path.exists(data_cfg.dataset_name):
+        os.makedirs(data_cfg.dataset_name)
 
-print(f"Opening train memmap: {os.path.join(data_cfg.dataset_name, 'train_with_mask_n_targets.bin')}")
-train_mm = make_memmap(os.path.join(data_cfg.dataset_name, 'train_with_mask_n_targets.bin'), train_shape, np.uint16)
-print(f"Opening val memmap: {os.path.join(data_cfg.dataset_name, 'val_with_mask_n_targets.bin')}")
-val_mm   = make_memmap(os.path.join(data_cfg.dataset_name, 'val_with_mask_n_targets.bin'),   val_shape,   np.uint16)
+    def make_memmap(path, shape, dtype):
+        print(f"Creating memmap for {path} with shape {shape} and dtype {dtype}")
+        return np.memmap(path, mode='w+', dtype=dtype, shape=shape)
 
-train_pos = 0
-val_pos = 0
+    total_len = data_cfg.n_data * data_cfg.sample_len
+    n_rows = 3
+    val_len = total_len // 16
 
-for rep in tqdm(range(data_cfg.num_passes)):
-    edges = sample_interleaved_edges_many(data_cfg.branching_factor, data_cfg.height, data_cfg.n_edges, data_cfg.n_interleaved, data_cfg.n_data_batch, seed0=data_cfg.seed+rep)
-    levels = np.ceil(np.log((((edges % data_cfg.n_nodes)+1) * (data_cfg.branching_factor - 1))+1) / np.log(data_cfg.branching_factor))
-    compacted = compact_nodes_many(edges)
-    roots_tiled = np.tile(np.arange(data_cfg.n_interleaved)*(data_cfg.n_edges+1), (data_cfg.n_data_batch, 1))
-    root_self_loops = np.repeat(roots_tiled, 2, axis=-1).reshape(compacted.shape[0], data_cfg.n_interleaved, 2)
-    compacted_with_root_self_loops = np.concatenate([root_self_loops, compacted], axis=-2)
-    data = np.concatenate([data_cfg.token_arr[-1]*np.ones_like(compacted_with_root_self_loops), compacted_with_root_self_loops], axis=-1)[:,:,1:]
-    targets = np.zeros_like(data)
-    targets[..., 2] = (data[..., 2] // (data_cfg.n_edges+1)) * (data_cfg.n_edges+1)
-    labels = np.concatenate([np.ones((len(levels), data_cfg.n_interleaved, 2)), levels], axis=1) # concatenate self-loops for the roots
-    labels = np.concatenate([np.zeros_like(labels), labels], axis=2)[:,:,1:] # result has last dim like [0, depth, depth]
-    mask = np.array(labels)
-    mask[..., :2] = 0 # only keep child tokens in the loss
-    # print(f"levels: {levels.shape}", f"data: {data.shape}", f"targets: {targets.shape}", f"mask: {mask.shape}")
+    # Total shapes for memmaps (we'll simply append pass-by-pass)
+    train_shape = (n_rows, total_len - val_len)
+    val_shape   = (n_rows, val_len)
 
-    data, targets, mask = (
-        jnp.array(data, dtype=jnp.uint16),
-        jnp.array(targets, dtype=jnp.uint16),
-        jnp.array(mask, dtype=jnp.uint16),
-    )
-    key_d2 = jax.random.PRNGKey(2 + rep)
-    key_perms = jax.random.split(key_d2, data_cfg.n_data_batch)
-    print("Generating token permutations (this can be slow)...")
-    tok_permutations = vmap(lambda k : jnp.concatenate(
-        [jax.random.permutation(k, len(data_cfg.token_arr)-1), data_cfg.token_arr[-1:]]
-    ))(key_perms)
-    print("Applying permutations to data and targets (this can be slow)...")
-    data_from_perms = vmap(lambda i : tok_permutations[i][data.reshape(data_cfg.n_data_batch, -1)[i]])(jnp.arange(data_cfg.n_data_batch))
-    targets_from_perms = vmap(lambda i : tok_permutations[i][targets.reshape(data_cfg.n_data_batch, -1)[i]])(jnp.arange(data_cfg.n_data_batch))
+    print(f"Opening train memmap: {os.path.join(data_cfg.dataset_name, 'train_with_mask_n_targets.bin')}")
+    train_mm = make_memmap(os.path.join(data_cfg.dataset_name, 'train_with_mask_n_targets.bin'), train_shape, np.uint16)
+    print(f"Opening val memmap: {os.path.join(data_cfg.dataset_name, 'val_with_mask_n_targets.bin')}")
+    val_mm   = make_memmap(os.path.join(data_cfg.dataset_name, 'val_with_mask_n_targets.bin'),   val_shape,   np.uint16)
+
+    train_pos = 0
+    val_pos = 0
+    val_ids = None
+
+    for rep in tqdm(range(data_cfg.num_passes)):
+        edges = sample_interleaved_edges_many(data_cfg.branching_factor, data_cfg.height, data_cfg.n_edges, data_cfg.n_interleaved, data_cfg.n_data_batch, seed0=data_cfg.seed+rep)
+        levels = np.ceil(np.log((((edges % data_cfg.n_nodes)+1) * (data_cfg.branching_factor - 1))+1) / np.log(data_cfg.branching_factor))
+        compacted = compact_nodes_many(edges)
+        roots_tiled = np.tile(np.arange(data_cfg.n_interleaved)*(data_cfg.n_edges+1), (data_cfg.n_data_batch, 1))
+        root_self_loops = np.repeat(roots_tiled, 2, axis=-1).reshape(compacted.shape[0], data_cfg.n_interleaved, 2)
+        compacted_with_root_self_loops = np.concatenate([root_self_loops, compacted], axis=-2)
+        data = np.concatenate([data_cfg.token_arr[-1]*np.ones_like(compacted_with_root_self_loops), compacted_with_root_self_loops], axis=-1)[:,:,1:]
+        targets = np.zeros_like(data)
+        targets[..., 2] = (data[..., 2] // (data_cfg.n_edges+1)) * (data_cfg.n_edges+1)
+        labels = np.concatenate([np.ones((len(levels), data_cfg.n_interleaved, 2)), levels], axis=1)
+        labels = np.concatenate([np.zeros_like(labels), labels], axis=2)[:,:,1:]
+        mask = np.array(labels)
+        mask[..., :2] = 0
+
+        data, targets, mask = (
+            jnp.array(data, dtype=jnp.uint16),
+            jnp.array(targets, dtype=jnp.uint16),
+            jnp.array(mask, dtype=jnp.uint16),
+        )
+        key_d2 = jax.random.PRNGKey(2 + rep)
+        key_perms = jax.random.split(key_d2, data_cfg.n_data_batch)
+        print("Generating token permutations (this can be slow)...")
+        tok_permutations = vmap(lambda k : jnp.concatenate(
+            [jax.random.permutation(k, len(data_cfg.token_arr)-1), data_cfg.token_arr[-1:]]
+        ))(key_perms)
+        print("Applying permutations to data and targets (this can be slow)...")
+        data_from_perms = vmap(lambda i : tok_permutations[i][data.reshape(data_cfg.n_data_batch, -1)[i]])(jnp.arange(data_cfg.n_data_batch))
+        targets_from_perms = vmap(lambda i : tok_permutations[i][targets.reshape(data_cfg.n_data_batch, -1)[i]])(jnp.arange(data_cfg.n_data_batch))
+        
+        data_from_perms_flat, targets_from_perms_flat = data_from_perms.flatten(), targets_from_perms.flatten()
+        mask_flat = mask.flatten()
+        data_with_mask_n_targets = jnp.stack([
+            data_from_perms_flat, targets_from_perms_flat, mask_flat
+        ], axis=0)
+        val_data_len = data_with_mask_n_targets.shape[1] // 16
+        assert val_data_len == val_len // data_cfg.num_passes
+        train_ids = data_with_mask_n_targets[:, :-val_data_len].astype(np.uint16)
+        val_ids = data_with_mask_n_targets[:, -val_data_len:].astype(np.uint16)
+
+        print(f"Writing train chunk [{train_pos}:{train_pos+train_ids.shape[1]}] and val chunk [{val_pos}:{val_pos+val_ids.shape[1]}] to disk...")
+        train_mm[:, train_pos:train_pos+train_ids.shape[1]] = np.array(train_ids, dtype=np.uint16)
+        val_mm[:, val_pos:val_pos+val_ids.shape[1]] = np.array(val_ids, dtype=np.uint16)
+        train_pos += train_ids.shape[1]
+        val_pos += val_ids.shape[1]
+
+        print(f"Pass {rep+1}/{data_cfg.num_passes} done. train_pos={train_pos}, val_pos={val_pos}")
+
+    print("Flushing memmaps to disk...")
+    train_mm.flush()
+    val_mm.flush()
+    print("Dataset generation done!")
     
-    data_from_perms_flat, targets_from_perms_flat = data_from_perms.flatten(), targets_from_perms.flatten()
-    mask_flat = mask.flatten()
-    data_with_mask_n_targets = jnp.stack([
-        data_from_perms_flat, targets_from_perms_flat, mask_flat
-    ], axis=0)
-    val_data_len = data_with_mask_n_targets.shape[1] // 16
-    assert val_data_len == val_len // data_cfg.num_passes
-    train_ids = data_with_mask_n_targets[:, :-val_data_len].astype(np.uint16)
-    val_ids = data_with_mask_n_targets[:, -val_data_len:].astype(np.uint16)
-
-    print(f"Writing train chunk [{train_pos}:{train_pos+train_ids.shape[1]}] and val chunk [{val_pos}:{val_pos+val_ids.shape[1]}] to disk...")
-    # Write this chunk to the train and val memmaps
-    train_mm[:, train_pos:train_pos+train_ids.shape[1]] = np.array(train_ids, dtype=np.uint16)
-    val_mm[:, val_pos:val_pos+val_ids.shape[1]] = np.array(val_ids, dtype=np.uint16)
-    train_pos += train_ids.shape[1]
-    val_pos += val_ids.shape[1]
-
-    print(f"Pass {rep+1}/{data_cfg.num_passes} done. train_pos={train_pos}, val_pos={val_pos}")
-
-print("Flushing memmaps to disk...")
-train_mm.flush()
-val_mm.flush()
-print("Done!")
+    return val_ids
 
 
-def extract_interleaved_edges(x, sample_ind = 0):
+def load_val_ids(data_cfg: DatasetConfig) -> np.ndarray:
+    """Load validation data from disk."""
+    val_path = os.path.join(data_cfg.dataset_name, 'val_with_mask_n_targets.bin')
+    total_len = data_cfg.n_data * data_cfg.sample_len
+    val_len = total_len // 16
+    n_rows = 3
+    val_shape = (n_rows, val_len)
+    return np.memmap(val_path, mode='r', dtype=np.uint16, shape=val_shape)
+
+
+def extract_interleaved_edges(x, sample_ind=0):
     return x[sample_ind*data_cfg.sample_len : (sample_ind+1)*data_cfg.sample_len]
 
-i = 0
-G = nx.DiGraph()
-G.add_edges_from(list(map(tuple, extract_interleaved_edges(val_ids[0], i).reshape(-1, 3)[:, 1:].tolist())))
-pos = dag_pos_dot(G)
-plt.figure(figsize=(8, 6))
-nx.draw(
-    G, pos=pos,
-    with_labels=True, node_size=120,
-    node_color="lightblue", edge_color="gray",
-    width=0.8, arrows=True, arrowsize=10
-)
-plt.savefig(f"{data_cfg.dataset_name}/example_input.png", bbox_inches="tight")
-plt.close()
 
-
+def save_example_graph(data_cfg: DatasetConfig, val_ids: np.ndarray):
+    """Save an example graph visualization."""
+    i = 0
+    G = nx.DiGraph()
+    G.add_edges_from(list(map(tuple, extract_interleaved_edges(val_ids[0], i).reshape(-1, 3)[:, 1:].tolist())))
+    pos = dag_pos_dot(G)
+    plt.figure(figsize=(8, 6))
+    nx.draw(
+        G, pos=pos,
+        with_labels=True, node_size=120,
+        node_color="lightblue", edge_color="gray",
+        width=0.8, arrows=True, arrowsize=10
+    )
+    plt.savefig(f"{data_cfg.dataset_name}/example_input.png", bbox_inches="tight")
+    plt.close()
 
 def create_train_config(
     data_cfg: DatasetConfig,
@@ -545,12 +567,8 @@ def create_train_config(
     embd_dim: int = 512,
     batch_size: int = 256,
     supervision_degree: SupervisionDegree = SupervisionDegree.FULL,
-    wandb_mode: str = "online",
-    wandb_project: str = "backtrack-sweep",
-    wandb_group: str = None,
 ) -> train.TrainConfig:
     """Create a TrainConfig with the given hyperparameters."""
-    # head_dim scales with embd_dim (half of embd_dim)
     if supervision_degree == SupervisionDegree.FULL:
         level_selection = jnp.arange(data_cfg.height)
     elif supervision_degree == SupervisionDegree.INTERMEDIATE:
@@ -587,9 +605,6 @@ def create_train_config(
         pos_encoding_base=2 * data_cfg.sample_len,
         log_interval=10_000,
         eval_interval=1_000,
-        wandb_mode=wandb_mode,
-        wandb_project=wandb_project,
-        wandb_group=wandb_group,
     )
 
 
@@ -655,162 +670,111 @@ def save_and_log_attention_figure(params, config, data_cfg, val_ids, run_name: s
     return save_path
 
 
-def run_sweep_train():
-    """Training function called by wandb sweep agent."""
-    # Initialize wandb run (sweep agent will have already set up the config)
-    run = wandb.init()
-    
-    # Get hyperparameters from wandb config
-    sweep_n_layer = wandb.config.n_layer
-    sweep_embd_dim = wandb.config.embd_dim
-    sweep_supervision_degree = SupervisionDegree(wandb.config.supervision_degree)
-    sweep_batch_size = wandb.config.batch_size
-    
-    print(f"Starting sweep run with: n_layer={sweep_n_layer}, embd_dim={sweep_embd_dim}, "
-          f"supervision={sweep_supervision_degree.value}, batch_size={sweep_batch_size}")
-    
-    config = create_train_config(
-        data_cfg=data_cfg,
-        n_layer=sweep_n_layer,
-        embd_dim=sweep_embd_dim,
-        batch_size=sweep_batch_size,
-        supervision_degree=sweep_supervision_degree,
-        wandb_mode="disabled",  # Sweep handles wandb, don't double-init
-    )
-    
-    params = train.train_loop(config)
-    
-    print("FINISHED TRAINING")
-    
-    # Log attention weights figure to wandb
-    run_name = f"L{sweep_n_layer}_E{sweep_embd_dim}_B{sweep_batch_size}_{sweep_supervision_degree.value}"
-    save_and_log_attention_figure(params, config, data_cfg, val_ids, run_name=run_name)
-    
-    run.finish()
-    return params
-
-
-def run_single_train(
-    n_layer: int = 4,
-    embd_dim: int = 512,
-    batch_size: int = 256,
-    supervision_degree: SupervisionDegree = SupervisionDegree.FULL,
-):
-    """Run a single training run without sweep."""
-    config = create_train_config(
-        data_cfg=data_cfg,
-        n_layer=n_layer,
-        embd_dim=embd_dim,
-        batch_size=batch_size,
-        supervision_degree=supervision_degree,
-        wandb_mode="online",
-        wandb_project="backtrack-single",
-    )
-    
-    params = train.train_loop(config)
-    print("FINISHED TRAINING")
-    return params
-
-
-def create_sweep(project: str = "backtrack-sweep") -> str:
-    """Create a wandb sweep and return the sweep ID."""
-    sweep_id = wandb.sweep(SWEEP_CONFIG, project=project)
-    print(f"Created sweep with ID: {sweep_id}")
-    return sweep_id
-
-
-def run_sweep_agent(sweep_id: str, project: str = "backtrack-sweep", count: int = None):
-    """Run a wandb sweep agent."""
-    wandb.agent(sweep_id, function=run_sweep_train, project=project, count=count)
-
-
-# Parse command line arguments
-parser = argparse.ArgumentParser(description="Backtrack task training with wandb sweep support")
-parser.add_argument("--mode", type=str, default="single", choices=["single", "create_sweep", "agent"],
-                    help="Mode: 'single' for single run, 'create_sweep' to create a sweep, 'agent' to run as sweep agent")
-parser.add_argument("--sweep_id", type=str, default=None, help="Sweep ID for agent mode")
-parser.add_argument("--project", type=str, default="backtrack-sweep", help="Wandb project name")
-parser.add_argument("--count", type=int, default=None, help="Number of runs for sweep agent (None for unlimited)")
-parser.add_argument("--n_layer", type=int, default=4, help="Number of layers (for single mode)")
-parser.add_argument("--embd_dim", type=int, default=512, help="Embedding dimension (for single mode)")
-parser.add_argument("--batch_size", type=int, default=256, help="Batch size (for single mode)")
-parser.add_argument("--supervision", type=str, default="full", choices=["full", "intermediate", "leaf"],
-                    help="Supervision degree (for single mode)")
-
-args = parser.parse_args()
-
-if args.mode == "single":
-    # Create config for evaluation
-    config = create_train_config(
-        data_cfg=data_cfg,
-        n_layer=args.n_layer,
-        embd_dim=args.embd_dim,
-        batch_size=args.batch_size,
-        supervision_degree=SupervisionDegree(args.supervision),
-        wandb_mode="disabled",
-    )
-    
-    params = run_single_train(
-        n_layer=args.n_layer,
-        embd_dim=args.embd_dim,
-        batch_size=args.batch_size,
-        supervision_degree=SupervisionDegree(args.supervision),
-    )
-    
-    # Evaluation code (only runs in single mode)
-    rope_params = model.precompute_pope(config.get_model_config(), None) if config.use_pope else model.precompute_rope(config.get_model_config(), None)
-
-    error_pct = jnp.empty(100)
-    for i in tqdm(range(len(error_pct))):
-        test_input_ids = extract_interleaved_edges(val_ids[0], i)
-        test_target_ids = extract_interleaved_edges(val_ids[1], i)
-        test_mask_ids = extract_interleaved_edges(val_ids[2], i)
-        res = model.gpt_forward(params, rope_params, test_input_ids[None,:], config.get_model_config())[0].argmax(axis=-1)
-
-        diff = jnp.count_nonzero(test_mask_ids * (test_target_ids - res))
-        error_pct = error_pct.at[i].set(diff / test_mask_ids.sum())
-    print(f"Error count: {error_pct.mean()}")
-
-    i = 0
-    test_input_ids = extract_interleaved_edges(val_ids[0], i)
-    test_target_ids = extract_interleaved_edges(val_ids[1], i)
-    test_mask_ids = extract_interleaved_edges(val_ids[2], i)
-    test_input_ids * test_mask_ids, res * test_mask_ids
-
-    preds, attn_weights = model.gpt_forward(params, rope_params, test_input_ids[None,:], config.get_model_config(), return_attn_weights=True)
-    res = preds[0].argmax(axis=-1)
-
-    query_subset = jnp.arange(2, data_cfg.sample_len, 3)
-    key_subset = jnp.concatenate([jnp.arange(1, data_cfg.sample_len, 3)[None, :], jnp.arange(2, data_cfg.sample_len, 3)[None, :]]).T.flatten()
-
-    # Determine num_layers and num_heads from attn_weights structure
-    num_layers = len(attn_weights)
-    num_heads = attn_weights[0][0].shape[0]  # Assuming shape: [num_heads, seq, seq]
-
-    fig, axes = plt.subplots(num_layers, num_heads, figsize=(6 * num_heads, 6 * num_layers), squeeze=False)
-
-    for l in range(num_layers):
-        for h in range(num_heads):
-            # sum over all heads because we only need two heads in the first layer
-            # remaining layers are splitting the single head into two (seems arbitrary)
-            selected_attn = attn_weights[l][0][h][query_subset[:, None], key_subset[None, :]].astype(np.float32)
-            ax = axes[l, h]
-            im = heatmap(
-                selected_attn,
-                test_input_ids[query_subset], test_input_ids[key_subset], ax=ax,
-                cmap="YlGnBu"
+def make_sweep_train_fn(data_cfg: DatasetConfig, val_ids: np.ndarray):
+    """Create a sweep training function with closed-over data_cfg and val_ids."""
+    def run_sweep_train():
+        """Training function called by wandb sweep agent."""
+        with wandb.init() as run:
+            # Get hyperparameters from wandb config
+            sweep_n_layer = wandb.config.n_layer
+            sweep_embd_dim = wandb.config.embd_dim
+            sweep_supervision_degree = SupervisionDegree(wandb.config.supervision_degree)
+            sweep_batch_size = wandb.config.batch_size
+            
+            print(f"Starting sweep run with: n_layer={sweep_n_layer}, embd_dim={sweep_embd_dim}, "
+                  f"supervision={sweep_supervision_degree.value}, batch_size={sweep_batch_size}")
+            
+            config = create_train_config(
+                data_cfg=data_cfg,
+                n_layer=sweep_n_layer,
+                embd_dim=sweep_embd_dim,
+                batch_size=sweep_batch_size,
+                supervision_degree=sweep_supervision_degree,
             )
-            ax.set_title(f"Layer {l}, Head {h}")
+            
+            params = train.train_loop(config)
+            
+            print("FINISHED TRAINING")
+            
+            # Log attention weights figure to wandb
+            run_name = f"L{sweep_n_layer}_E{sweep_embd_dim}_B{sweep_batch_size}_{sweep_supervision_degree.value}"
+            save_and_log_attention_figure(params, config, data_cfg, val_ids, run_name=run_name)
+        
+        return params
+    
+    return run_sweep_train
 
-    fig.tight_layout()
-    plt.show()
 
-elif args.mode == "create_sweep":
-    sweep_id = create_sweep(project=args.project)
-    print(f"\nTo run agents, use:\n  python train_backtrack.py --mode agent --sweep_id {sweep_id} --project {args.project}")
+def run_sweep(
+    data_cfg: DatasetConfig,
+    val_ids: np.ndarray,
+    project: str = "backtrack-sweep",
+    count: int = None,
+    sweep_config_overrides: dict = None,
+):
+    """Create a wandb sweep and run the agent."""
+    sweep_config = SWEEP_CONFIG.copy()
+    sweep_config["parameters"] = SWEEP_CONFIG["parameters"].copy()
+    
+    if sweep_config_overrides:
+        for key, value in sweep_config_overrides.items():
+            if key in sweep_config["parameters"]:
+                sweep_config["parameters"][key] = {"values": value if isinstance(value, list) else [value]}
+    
+    sweep_id = wandb.sweep(sweep_config, project=project)
+    print(f"Created sweep with ID: {sweep_id}")
+    
+    sweep_train_fn = make_sweep_train_fn(data_cfg, val_ids)
+    wandb.agent(sweep_id, function=sweep_train_fn, project=project, count=count)
 
-elif args.mode == "agent":
-    if args.sweep_id is None:
-        print("Error: --sweep_id is required for agent mode")
-        exit(1)
-    run_sweep_agent(sweep_id=args.sweep_id, project=args.project, count=args.count)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Backtrack task training sweep")
+    parser.add_argument("--recreate_data", action="store_true",
+                        help="Force recreation of the dataset even if it exists")
+    parser.add_argument("--project", type=str, default="backtrack-sweep", 
+                        help="Wandb project name")
+    parser.add_argument("--count", type=int, default=None, 
+                        help="Number of runs (None for all combinations)")
+    parser.add_argument("--n_layer", type=int, nargs="+", default=None,
+                        help="Override n_layer values (default: SWEEP_CONFIG)")
+    parser.add_argument("--embd_dim", type=int, nargs="+", default=None,
+                        help="Override embd_dim values (default: SWEEP_CONFIG)")
+    parser.add_argument("--batch_size", type=int, nargs="+", default=None,
+                        help="Override batch_size values (default: SWEEP_CONFIG)")
+    parser.add_argument("--supervision", type=str, nargs="+", default=None,
+                        choices=["full", "intermediate", "leaf"],
+                        help="Override supervision values (default: SWEEP_CONFIG)")
+    
+    args = parser.parse_args()
+    
+    # Handle dataset creation
+    if args.recreate_data or not dataset_exists(data_cfg):
+        if dataset_exists(data_cfg):
+            print("--recreate_data specified, regenerating dataset...")
+        else:
+            print("Dataset not found, generating...")
+        val_ids = generate_dataset(data_cfg)
+        save_example_graph(data_cfg, val_ids)
+    else:
+        print("Dataset already exists, loading from disk...")
+        val_ids = load_val_ids(data_cfg)
+    
+    # Build overrides from CLI args
+    sweep_overrides = {}
+    if args.n_layer is not None:
+        sweep_overrides["n_layer"] = args.n_layer
+    if args.embd_dim is not None:
+        sweep_overrides["embd_dim"] = args.embd_dim
+    if args.batch_size is not None:
+        sweep_overrides["batch_size"] = args.batch_size
+    if args.supervision is not None:
+        sweep_overrides["supervision_degree"] = args.supervision
+    
+    run_sweep(
+        data_cfg=data_cfg,
+        val_ids=val_ids,
+        project=args.project,
+        count=args.count,
+        sweep_config_overrides=sweep_overrides if sweep_overrides else None,
+    )
