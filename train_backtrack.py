@@ -39,7 +39,7 @@ SWEEP_CONFIG = {
         "n_layer": {"values": [2, 4, 6]},
         "embd_dim": {"values": [512, 1024]},
         "supervision_degree": {"values": ["full", "intermediate", "leaf"]},
-        "batch_size": {"values": [64, 256]},
+        "batch_size": {"values": [256]},
     },
 }
 
@@ -433,7 +433,7 @@ data_cfg = DatasetConfig(
     n_interleaved=2,
     branching_factor=2,
     height=9,
-    n_data=2**19 * 3,
+    n_data=2**21 * 3,
     n_data_batch=2**18,
     seed=123,
 )
@@ -575,6 +575,7 @@ def create_train_config(
         level_selection = jnp.arange(data_cfg.height, step=2)
     elif supervision_degree == SupervisionDegree.LEAF:
         level_selection = jnp.array([data_cfg.height - 1])
+    print(f"Level selection: {level_selection}")
     
     loss_combiner = lambda sums, counts: (sums[level_selection] / jnp.maximum(counts[level_selection], 1)).mean()
     
@@ -603,7 +604,7 @@ def create_train_config(
         num_loss_groups=data_cfg.height,
         loss_combiner=loss_combiner,
         pos_encoding_base=2 * data_cfg.sample_len,
-        log_interval=10_000,
+        log_interval=1_000,
         eval_interval=1_000,
     )
 
@@ -632,7 +633,7 @@ def generate_attention_figure(params, config, data_cfg, val_ids, sample_idx: int
     num_layers = len(attn_weights)
     num_heads = attn_weights[0][0].shape[0]
     
-    fig, axes = plt.subplots(num_layers, num_heads, figsize=(6 * num_heads, 6 * num_layers), squeeze=False)
+    fig, axes = plt.subplots(num_layers, num_heads, figsize=(16 * num_heads, 16 * num_layers), squeeze=False)
     
     for l in range(num_layers):
         for h in range(num_heads):
@@ -730,8 +731,8 @@ def run_sweep(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Backtrack task training sweep")
-    parser.add_argument("--recreate_data", action="store_true",
-                        help="Force recreation of the dataset even if it exists")
+    parser.add_argument("--skip_data", action="store_true",
+                        help="Skip dataset creation and load from disk")
     parser.add_argument("--project", type=str, default="backtrack-sweep", 
                         help="Wandb project name")
     parser.add_argument("--count", type=int, default=None, 
@@ -749,16 +750,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # Handle dataset creation
-    if args.recreate_data or not dataset_exists(data_cfg):
-        if dataset_exists(data_cfg):
-            print("--recreate_data specified, regenerating dataset...")
-        else:
-            print("Dataset not found, generating...")
+    if args.skip_data:
+        if not dataset_exists(data_cfg):
+            raise RuntimeError(f"--skip_data specified but dataset not found in {data_cfg.dataset_name}/")
+        print("Skipping dataset creation, loading from disk...")
+        val_ids = load_val_ids(data_cfg)
+    else:
+        print("Generating dataset...")
         val_ids = generate_dataset(data_cfg)
         save_example_graph(data_cfg, val_ids)
-    else:
-        print("Dataset already exists, loading from disk...")
-        val_ids = load_val_ids(data_cfg)
     
     # Build overrides from CLI args
     sweep_overrides = {}
