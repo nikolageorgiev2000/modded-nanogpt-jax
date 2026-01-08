@@ -12,6 +12,8 @@ import matplotlib
 from matplotlib import pyplot as plt
 import os
 import argparse
+import hashlib
+import json
 from math import ceil, log
 
 import networkx as nx
@@ -684,6 +686,26 @@ def save_and_log_attention_figure(params, config, data_cfg, val_ids, run_name: s
     return save_path
 
 
+def generate_sweep_hash(sweep_config_overrides: dict = None) -> str:
+    """Generate a short hash identifying this sweep configuration."""
+    # Start with default sweep config
+    params = SWEEP_CONFIG["parameters"].copy()
+    
+    # Apply overrides
+    if sweep_config_overrides:
+        for key, value in sweep_config_overrides.items():
+            if key in params:
+                params[key] = {"values": value if isinstance(value, list) else [value]}
+    
+    # Create deterministic string representation
+    # Sort keys for consistency
+    param_str = json.dumps(params, sort_keys=True, default=str)
+    
+    # Generate hash (first 8 characters)
+    hash_obj = hashlib.sha256(param_str.encode())
+    return hash_obj.hexdigest()[:8]
+
+
 def generate_sweep_combinations(sweep_config_overrides: dict = None) -> list[dict]:
     """Generate all combinations from SWEEP_CONFIG parameters."""
     import itertools
@@ -723,6 +745,10 @@ def run_sweep(
     All processes compute the same configs deterministically and run train_loop together.
     Only master logs to wandb.
     """
+    # Generate sweep hash for filtering (deterministic, same on all processes)
+    sweep_hash = generate_sweep_hash(sweep_config_overrides)
+    print(f"[Process {jax.process_index()}] Sweep hash: {sweep_hash}")
+    
     # Generate all combinations (deterministic, same on all processes)
     combinations = generate_sweep_combinations(sweep_config_overrides)
     
@@ -739,11 +765,14 @@ def run_sweep(
         
         # Master initializes wandb run
         if is_master_process():
+            # Add sweep hash to combo config for filtering
+            combo_with_hash = combo.copy()
+            combo_with_hash["sweep_hash"] = sweep_hash
+            
             wandb.init(
                 project=project,
                 name=run_name,
-                config=combo,
-                finish_previous=True,
+                config=combo_with_hash,
             )
         
         # All processes create the same config deterministically
