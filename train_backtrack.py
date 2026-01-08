@@ -12,6 +12,7 @@ import matplotlib
 from matplotlib import pyplot as plt
 import os
 import argparse
+from math import ceil, log
 
 import networkx as nx
 from networkx.drawing.nx_pydot import graphviz_layout
@@ -27,7 +28,7 @@ class SupervisionDegree(Enum):
     """Degree of supervision for training."""
     FULL = "full"           # Supervise all nodes
     INTERMEDIATE = "intermediate"  # Supervise intermediate nodes only
-    LEAF = "leaf"           # Supervise leaf nodes only
+    TERMINAL = "terminal"           # Supervise terminal nodes only
 
 
 # Sweep configuration
@@ -36,10 +37,11 @@ SWEEP_CONFIG = {
     "name": "backtrack-sweep",
     "metric": {"name": "val_loss", "goal": "minimize"},
     "parameters": {
-        "n_layer": {"values": [2, 4, 6]},
-        "embd_dim": {"values": [512, 1024]},
-        "supervision_degree": {"values": ["full", "intermediate", "leaf"]},
-        "batch_size": {"values": [256]},
+        "n_layer": {"values": [1, 2, 3, 4, 5, 6]},
+        "embd_dim": {"values": [256, 512]},
+        "supervision_degree": {"values": ["full", "intermediate", "terminal"]},
+        "batch_size": {"values": [128]},
+        "seed": {"values": [0, 10, 42, 1337, 42069]},
     },
 }
 
@@ -440,7 +442,7 @@ data_cfg = DatasetConfig(
     n_interleaved=2,
     branching_factor=2,
     height=9,
-    n_data=2**21 * 3,
+    n_data=2**22 * 3,
     n_data_batch=2**18,
     seed=123,
 )
@@ -570,14 +572,16 @@ def create_train_config(
     embd_dim: int = 512,
     batch_size: int = 256,
     supervision_degree: SupervisionDegree = SupervisionDegree.FULL,
+    seed: int = 0,
 ) -> train.TrainConfig:
     """Create a TrainConfig with the given hyperparameters."""
     if supervision_degree == SupervisionDegree.FULL:
         level_selection = jnp.arange(data_cfg.height)
     elif supervision_degree == SupervisionDegree.INTERMEDIATE:
         level_selection = jnp.arange(data_cfg.height, step=2)
-    elif supervision_degree == SupervisionDegree.LEAF:
-        level_selection = jnp.array([data_cfg.height - 1])
+    elif supervision_degree == SupervisionDegree.TERMINAL:
+        level_selection = jnp.array([data_cfg.height-1 - i for i in range(3)])
+    level_selection = level_selection.astype(jnp.uint16)
     print(f"Level selection: {level_selection}")
     
     loss_combiner = lambda sums, counts: (sums[level_selection] / jnp.maximum(counts[level_selection], 1)).mean()
@@ -586,14 +590,14 @@ def create_train_config(
         input_bin=f"{data_cfg.dataset_name}/train_with_mask_n_targets.bin",
         input_val_bin=f"{data_cfg.dataset_name}/val_with_mask_n_targets.bin",
         embd_dim=embd_dim,
-        head_dim=256,
+        head_dim=128,
         n_layer=n_layer,
         block_size=data_cfg.sample_len,
         batch_size=batch_size,
         gradient_accumulation_steps=1,
         max_iters=100_000,
         eval_iters=25,
-        learning_rate=1e-3,
+        learning_rate=6e-4,
         min_lr=0,
         warmup_iters=10_000,
         lr_decay_iters=100_000,
@@ -609,6 +613,7 @@ def create_train_config(
         pos_encoding_base=2 * data_cfg.sample_len,
         log_interval=1_000,
         eval_interval=1_000,
+        seed=seed,
     )
 
 
@@ -684,9 +689,13 @@ def make_sweep_train_fn(data_cfg: DatasetConfig, val_ids: np.ndarray):
             sweep_embd_dim = wandb.config.embd_dim
             sweep_supervision_degree = SupervisionDegree(wandb.config.supervision_degree)
             sweep_batch_size = wandb.config.batch_size
+            sweep_seed = wandb.config.seed
             
+            run_name = f"L{sweep_n_layer}_E{sweep_embd_dim}_B{sweep_batch_size}_{sweep_supervision_degree.value}_S{sweep_seed}"
+            run.name = run_name
+
             print(f"Starting sweep run with: n_layer={sweep_n_layer}, embd_dim={sweep_embd_dim}, "
-                  f"supervision={sweep_supervision_degree.value}, batch_size={sweep_batch_size}")
+                  f"supervision={sweep_supervision_degree.value}, batch_size={sweep_batch_size}, seed={sweep_seed}")
             
             config = create_train_config(
                 data_cfg=data_cfg,
@@ -694,6 +703,7 @@ def make_sweep_train_fn(data_cfg: DatasetConfig, val_ids: np.ndarray):
                 embd_dim=sweep_embd_dim,
                 batch_size=sweep_batch_size,
                 supervision_degree=sweep_supervision_degree,
+                seed=sweep_seed,
             )
             
             params = train.train_loop(config)
@@ -701,7 +711,6 @@ def make_sweep_train_fn(data_cfg: DatasetConfig, val_ids: np.ndarray):
             print("FINISHED TRAINING")
             
             # Log attention weights figure to wandb
-            run_name = f"L{sweep_n_layer}_E{sweep_embd_dim}_B{sweep_batch_size}_{sweep_supervision_degree.value}"
             save_and_log_attention_figure(params, config, data_cfg, val_ids, run_name=run_name)
         
         return params
@@ -749,6 +758,8 @@ if __name__ == "__main__":
     parser.add_argument("--supervision", type=str, nargs="+", default=None,
                         choices=["full", "intermediate", "leaf"],
                         help="Override supervision values (default: SWEEP_CONFIG)")
+    parser.add_argument("--seed", type=int, nargs="+", default=None,
+                        help="Override seed values (default: SWEEP_CONFIG)")
     
     args = parser.parse_args()
     
@@ -773,6 +784,8 @@ if __name__ == "__main__":
         sweep_overrides["batch_size"] = args.batch_size
     if args.supervision is not None:
         sweep_overrides["supervision_degree"] = args.supervision
+    if args.seed is not None:
+        sweep_overrides["seed"] = args.seed
     
     run_sweep(
         data_cfg=data_cfg,
