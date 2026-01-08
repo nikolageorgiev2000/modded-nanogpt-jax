@@ -648,7 +648,7 @@ def generate_attention_figure(params, config, data_cfg, val_ids, sample_idx: int
     num_layers = len(attn_weights)
     num_heads = attn_weights[0][0].shape[0]
     
-    fig, axes = plt.subplots(num_layers, num_heads, figsize=(16 * num_heads, 16 * num_layers), squeeze=False)
+    fig, axes = plt.subplots(num_layers, num_heads, figsize=(24 * num_heads, 14 * num_layers), squeeze=False)
     
     for l in range(num_layers):
         for h in range(num_heads):
@@ -669,6 +669,9 @@ def save_and_log_attention_figure(params, config, data_cfg, val_ids, run_name: s
     """Generate attention figure, save to PNG, and log to wandb."""
     fig = generate_attention_figure(params, config, data_cfg, val_ids)
     
+    if not is_master_process():
+        return None
+
     # Create unique filename with run name if provided
     if run_name:
         save_path = f"{data_cfg.dataset_name}/attention_weights_{run_name}.png"
@@ -773,6 +776,7 @@ def run_sweep(
                 project=project,
                 name=run_name,
                 config=combo_with_hash,
+                reinit='finish_previous',
             )
         
         # All processes create the same config deterministically
@@ -795,12 +799,12 @@ def run_sweep(
         
         print(f"[Process {jax.process_index()}] FINISHED TRAINING: {run_name}")
         
-        # Only master logs attention figure and finishes wandb run
+        save_and_log_attention_figure(params, config, data_cfg, val_ids, run_name=run_name)
+
         if is_master_process():
-            save_and_log_attention_figure(params, config, data_cfg, val_ids, run_name=run_name)
             wandb.finish()
         
-        # Sync all processes before next run
+        # # Sync all processes before next run
         jax.experimental.multihost_utils.sync_global_devices(f"run_{run_idx}")
 
 
