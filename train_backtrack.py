@@ -37,10 +37,10 @@ SWEEP_CONFIG = {
     "name": "backtrack-sweep",
     "metric": {"name": "val_loss", "goal": "minimize"},
     "parameters": {
-        "n_layer": {"values": [1, 2, 3, 4, 5, 6]},
-        "embd_dim": {"values": [256, 512]},
+        "n_layer": {"values": [3, 4, 8]},
+        "embd_dim": {"values": [512, 1024]},
         "supervision_degree": {"values": ["full", "intermediate", "terminal"]},
-        "batch_size": {"values": [128]},
+        "batch_size": {"values": [256]},
         "seed": {"values": [0, 10, 42, 1337, 42069]},
     },
 }
@@ -91,6 +91,11 @@ class DatasetConfig:
             f"Balanced tree too small: n_nodes={self.n_nodes} < n_edges+1={self.n_edges + 1}"
 
 jax.distributed.initialize()
+
+
+def is_master_process() -> bool:
+    """Check if current process is the master (rank 0)."""
+    return jax.process_index() == 0
 
 
 def heatmap(data, row_labels, col_labels, ax=None, **kwargs):
@@ -590,14 +595,14 @@ def create_train_config(
         input_bin=f"{data_cfg.dataset_name}/train_with_mask_n_targets.bin",
         input_val_bin=f"{data_cfg.dataset_name}/val_with_mask_n_targets.bin",
         embd_dim=embd_dim,
-        head_dim=128,
+        head_dim=256,
         n_layer=n_layer,
         block_size=data_cfg.sample_len,
         batch_size=batch_size,
         gradient_accumulation_steps=1,
         max_iters=100_000,
         eval_iters=25,
-        learning_rate=6e-4,
+        learning_rate=3e-4,
         min_lr=0,
         warmup_iters=10_000,
         lr_decay_iters=100_000,
@@ -679,43 +684,30 @@ def save_and_log_attention_figure(params, config, data_cfg, val_ids, run_name: s
     return save_path
 
 
-def make_sweep_train_fn(data_cfg: DatasetConfig, val_ids: np.ndarray):
-    """Create a sweep training function with closed-over data_cfg and val_ids."""
-    def run_sweep_train():
-        """Training function called by wandb sweep agent."""
-        with wandb.init() as run:
-            # Get hyperparameters from wandb config
-            sweep_n_layer = wandb.config.n_layer
-            sweep_embd_dim = wandb.config.embd_dim
-            sweep_supervision_degree = SupervisionDegree(wandb.config.supervision_degree)
-            sweep_batch_size = wandb.config.batch_size
-            sweep_seed = wandb.config.seed
-            
-            run_name = f"L{sweep_n_layer}_E{sweep_embd_dim}_B{sweep_batch_size}_{sweep_supervision_degree.value}_S{sweep_seed}"
-            run.name = run_name
-
-            print(f"Starting sweep run with: n_layer={sweep_n_layer}, embd_dim={sweep_embd_dim}, "
-                  f"supervision={sweep_supervision_degree.value}, batch_size={sweep_batch_size}, seed={sweep_seed}")
-            
-            config = create_train_config(
-                data_cfg=data_cfg,
-                n_layer=sweep_n_layer,
-                embd_dim=sweep_embd_dim,
-                batch_size=sweep_batch_size,
-                supervision_degree=sweep_supervision_degree,
-                seed=sweep_seed,
-            )
-            
-            params = train.train_loop(config)
-            
-            print("FINISHED TRAINING")
-            
-            # Log attention weights figure to wandb
-            save_and_log_attention_figure(params, config, data_cfg, val_ids, run_name=run_name)
-        
-        return params
+def generate_sweep_combinations(sweep_config_overrides: dict = None) -> list[dict]:
+    """Generate all combinations from SWEEP_CONFIG parameters."""
+    import itertools
     
-    return run_sweep_train
+    # Start with default sweep config
+    params = SWEEP_CONFIG["parameters"].copy()
+    
+    # Apply overrides
+    if sweep_config_overrides:
+        for key, value in sweep_config_overrides.items():
+            if key in params:
+                params[key] = {"values": value if isinstance(value, list) else [value]}
+    
+    # Extract value lists
+    keys = list(params.keys())
+    value_lists = [params[k]["values"] for k in keys]
+    
+    # Generate all combinations
+    combinations = []
+    for values in itertools.product(*value_lists):
+        combo = dict(zip(keys, values))
+        combinations.append(combo)
+    
+    return combinations
 
 
 def run_sweep(
@@ -725,20 +717,62 @@ def run_sweep(
     count: int = None,
     sweep_config_overrides: dict = None,
 ):
-    """Create a wandb sweep and run the agent."""
-    sweep_config = SWEEP_CONFIG.copy()
-    sweep_config["parameters"] = SWEEP_CONFIG["parameters"].copy()
+    """
+    Run training over all sweep config combinations.
     
-    if sweep_config_overrides:
-        for key, value in sweep_config_overrides.items():
-            if key in sweep_config["parameters"]:
-                sweep_config["parameters"][key] = {"values": value if isinstance(value, list) else [value]}
+    All processes compute the same configs deterministically and run train_loop together.
+    Only master logs to wandb.
+    """
+    # Generate all combinations (deterministic, same on all processes)
+    combinations = generate_sweep_combinations(sweep_config_overrides)
     
-    sweep_id = wandb.sweep(sweep_config, project=project)
-    print(f"Created sweep with ID: {sweep_id}")
+    if count is not None:
+        combinations = combinations[:count]
     
-    sweep_train_fn = make_sweep_train_fn(data_cfg, val_ids)
-    wandb.agent(sweep_id, function=sweep_train_fn, project=project, count=count)
+    total_runs = len(combinations)
+    print(f"[Process {jax.process_index()}] Running {total_runs} training configurations")
+    
+    for run_idx, combo in enumerate(combinations):
+        run_name = f"L{combo['n_layer']}_E{combo['embd_dim']}_B{combo['batch_size']}_{combo['supervision_degree']}_S{combo['seed']}"
+        
+        print(f"\n[Process {jax.process_index()}] === Run {run_idx + 1}/{total_runs}: {run_name} ===")
+        
+        # Master initializes wandb run
+        if is_master_process():
+            wandb.init(
+                project=project,
+                name=run_name,
+                config=combo,
+                finish_previous=True,
+            )
+        
+        # All processes create the same config deterministically
+        config = create_train_config(
+            data_cfg=data_cfg,
+            n_layer=combo["n_layer"],
+            embd_dim=combo["embd_dim"],
+            batch_size=combo["batch_size"],
+            supervision_degree=SupervisionDegree(combo["supervision_degree"]),
+            seed=combo["seed"],
+        )
+        
+        # Master logs full config to wandb
+        if is_master_process():
+            config_dict = {k: v for k, v in vars(config).items() if not callable(v)}
+            wandb.config.update(config_dict, allow_val_change=True)
+        
+        # All processes run train_loop together
+        params = train.train_loop(config)
+        
+        print(f"[Process {jax.process_index()}] FINISHED TRAINING: {run_name}")
+        
+        # Only master logs attention figure and finishes wandb run
+        if is_master_process():
+            save_and_log_attention_figure(params, config, data_cfg, val_ids, run_name=run_name)
+            wandb.finish()
+        
+        # Sync all processes before next run
+        jax.experimental.multihost_utils.sync_global_devices(f"run_{run_idx}")
 
 
 if __name__ == "__main__":
@@ -763,16 +797,22 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    # Handle dataset creation
     if args.skip_data:
         if not dataset_exists(data_cfg):
             raise RuntimeError(f"--skip_data specified but dataset not found in {data_cfg.dataset_name}/")
         print("Skipping dataset creation, loading from disk...")
-        val_ids = load_val_ids(data_cfg)
     else:
-        print("Generating dataset...")
-        val_ids = generate_dataset(data_cfg)
-        save_example_graph(data_cfg, val_ids)
+        # Handle dataset creation - only on master process
+        if is_master_process():
+            print("Generating dataset...")
+            generate_dataset(data_cfg)
+            save_example_graph(data_cfg, load_val_ids(data_cfg))
+    
+    # Synchronize all processes after dataset generation
+    jax.experimental.multihost_utils.sync_global_devices("dataset_ready")
+    
+    # All processes load val_ids from disk after sync
+    val_ids = load_val_ids(data_cfg)
     
     # Build overrides from CLI args
     sweep_overrides = {}
@@ -787,6 +827,7 @@ if __name__ == "__main__":
     if args.seed is not None:
         sweep_overrides["seed"] = args.seed
     
+    # Run sweep - all processes participate, master coordinates wandb
     run_sweep(
         data_cfg=data_cfg,
         val_ids=val_ids,
