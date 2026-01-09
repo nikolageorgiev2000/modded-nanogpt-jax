@@ -127,7 +127,7 @@ def heatmap(data, row_labels, col_labels, ax=None, **kwargs):
 
     # Show all ticks and label them with the respective list entries.
     ax.set_xticks(range(data.shape[1]), labels=col_labels,
-                  rotation=0, ha="right", rotation_mode="anchor", fontsize=6)
+                  rotation=90, ha="right", rotation_mode="anchor", fontsize=6)
     ax.set_yticks(range(data.shape[0]), labels=row_labels, fontsize=6)
 
     # Let the horizontal axes labeling appear on top.
